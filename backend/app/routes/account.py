@@ -12,9 +12,12 @@ from functools import wraps
 
 import jwt
 from flask import Blueprint, jsonify, request, current_app
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 from app.services import accounts_service
 from app.services.accounts_service import AccountsError
+from app.utils import get_secret
 
 account_bp = Blueprint("account", __name__)
 
@@ -105,6 +108,44 @@ def login():
 
     if not success:
         return jsonify({"error": result}), 401
+
+    token = _generate_token(result["username"])
+    return jsonify({"token": token, "user": result})
+
+
+@account_bp.route("/google-login", methods=["POST"])
+def google_login():
+    data = request.get_json(force=True, silent=True) or {}
+    credential = data.get("credential", "")
+    if not credential:
+        return jsonify({"error": "Missing Google credential."}), 400
+
+    client_id = get_secret("GOOGLE_CLIENT_ID")
+    if not client_id:
+        return jsonify({"error": "Google sign-in isn't configured on the server yet."}), 500
+
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), client_id
+        )
+    except ValueError:
+        return jsonify({"error": "Invalid or expired Google credential."}), 401
+
+    if not idinfo.get("email_verified", False):
+        return jsonify({"error": "Your Google email isn't verified."}), 401
+
+    email = idinfo.get("email", "")
+    name = idinfo.get("name", "")
+    picture = idinfo.get("picture", "")
+    google_sub = idinfo.get("sub", "")
+
+    try:
+        success, result = accounts_service.google_sign_in(email, name, google_sub, picture)
+    except AccountsError as e:
+        return jsonify({"error": str(e)}), 502
+
+    if not success:
+        return jsonify({"error": result}), 400
 
     token = _generate_token(result["username"])
     return jsonify({"token": token, "user": result})

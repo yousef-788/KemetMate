@@ -1,29 +1,10 @@
-"""
-Trip Planner Service
----------------------
-منقول من src/trip_planner.py (نسخة Streamlit القديمة). نفس منطق الداتا بالظبط:
-- فلترة المدن/المحافظات (CITY_SYNONYMS + REGION_FALLBACK) على نفس ملفات الـ CSV.
-- اختيار الفنادق/المطاعم/المعالم حسب الميزانية والاهتمامات.
-- بناء خطة يوم بيوم.
-
-الفرق الأساسي عن النسخة القديمة:
-1) مفيش st.* خالص - كل حاجة كانت بتتكتب في st.session_state دلوقتي بترجع كـ dict
-   عادي من build_plan()، والـ route (routes/trip_planner.py) هو اللي يحولها JSON.
-2) بدل الاستدعاء المباشر لـ Gemini في _optional_ai_summary القديمة، دلوقتي بنعدي
-   على app.services.chatbot_service (نفس نظام الـ RAG اللي شغال في صفحة الشات):
-   - retrieve_relevant_chunks() تجيب أقرب أجزاء من نفس الداتا ليك (Azure data lake)
-     بتاعة الفنادق/المطاعم/المتاحف/الآثار المرتبطة بمدن الرحلة.
-   - _call_gemini() هو نفس الموديل المستخدم في الشات (مفيش تكرار كود Gemini).
-   - detect_text_direction() عشان نعرف الرد rtl ولا ltr زي الشات بالظبط.
-   بالإضافة لسؤال-وجواب حر عن الخطة (ask_about_plan) بيستخدم نفس الـ RAG، فبقى
-   الـ trip planner والـ chatbot بيشربوا من نفس مصدر المعرفة.
-"""
 import datetime
 import io
 import json
 import re
 import threading
 import time
+from urllib.parse import quote_plus
 
 import pandas as pd
 from azure.cosmos import CosmosClient, PartitionKey, exceptions
@@ -102,7 +83,7 @@ DEFAULT_PREFERENCES = {
     # removed), but the day-builder's evening text still references it, so it
     # keeps a fixed internal default instead of exposing a selector for it.
     "pace": "Balanced",
-    "num_hotels": 6, "num_restaurants": 6,
+    "num_hotels": 6, "num_restaurants": 6, "num_beaches": 4,
 }
 
 
@@ -233,18 +214,67 @@ def _norm(text):
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
+def _colmap(df):
+    """Case-insensitive lookup: lowercase column name -> actual column name.
+    The silver-container migration renamed several columns to lowercase
+    snake_case, so anywhere this file expects a specific casing, resolving
+    through this map first makes it work regardless of exact casing."""
+    return {str(c).strip().lower(): c for c in df.columns}
+
+
+def _pick(row, colmap, *candidates):
+    """First non-empty value across a list of candidate column names
+    (case-insensitive) — lets a single call site tolerate several possible
+    real-world column names for the "same" field."""
+    for cand in candidates:
+        real = colmap.get(cand.lower())
+        if real is None:
+            continue
+        val = row.get(real)
+        if pd.notna(val) and str(val).strip() and str(val).strip().lower() != "nan":
+            return val
+    return None
+
+
 def _match_mask(df, city_columns, terms):
     mask = pd.Series(False, index=df.index)
     if not terms:
         return mask
+    cmap = _colmap(df)
     for col in city_columns:
-        if col in df.columns:
-            values = df[col].fillna("").astype(str).map(_norm)
+        real = cmap.get(col.lower())
+        if real is not None:
+            values = df[real].fillna("").astype(str).map(_norm)
             for term in terms:
                 if not term:
                     continue
                 mask = mask | values.str.contains(re.escape(term), case=False, na=False)
     return mask
+
+
+def _top_up_rows(primary_df, pools, target_count):
+    """Ensure at least target_count rows by backfilling from `pools` (an
+    ordered list of broader fallback dataframes — e.g. the same city's
+    unfiltered rows, then the whole country) without duplicating rows
+    already present (matched by index). Returns (df, was_topped_up).
+
+    Without this, a request for e.g. 6 restaurants could silently come back
+    with 2 just because only 2 rows matched both the chosen city AND the
+    chosen budget tier — even though the dataset has plenty more restaurants
+    for that city outside that exact price band, or nearby. We'd rather show
+    a fuller list plus an honest note than a suspiciously short one."""
+    result = primary_df
+    topped = False
+    for pool in pools:
+        if pool is None or pool.empty or len(result) >= target_count:
+            continue
+        missing_idx = pool.index.difference(result.index)
+        extra = pool.loc[missing_idx]
+        needed = target_count - len(result)
+        if needed > 0 and not extra.empty:
+            result = pd.concat([result, extra.head(needed)])
+            topped = True
+    return result, topped
 
 
 def _filter_city(df, city_columns, cities, destination, allow_region_fallback=True):
@@ -297,19 +327,6 @@ ATTRACTION_FALLBACK_IMAGES = [
     "https://images.unsplash.com/photo-1591116237842-e2c5ab7a6d6b?w=600",
 ]
 
-RESTAURANT_IMAGES = [
-    "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=600",
-    "https://images.unsplash.com/photo-1552566626-52f8b828add9?w=600",
-    "https://images.unsplash.com/photo-1550966871-3ed3cdb5ed0c?w=600",
-    "https://images.unsplash.com/photo-1544148103-0773bf10d330?w=600",
-    "https://images.unsplash.com/photo-1559339352-11d035aa65de?w=600",
-    "https://images.unsplash.com/photo-1574936145840-28808d77a0b6?w=600",
-    "https://images.unsplash.com/photo-1505826759037-1a69cb502211?w=600",
-    "https://images.unsplash.com/photo-1525640788966-69bdb028aa73?w=600",
-    "https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=600",
-    "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=600",
-]
-
 HOTEL_FALLBACK_IMAGES = [
     "https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600",
     "https://images.unsplash.com/photo-1571003123894-1f0594d2b5d9?w=600",
@@ -337,24 +354,110 @@ def _safe_image(url, name, fallback_pool):
     return fallback_pool[idx]
 
 
-def _records_from_attractions(df, name_col, city_col, desc_col, img_col, price_col, limit=12):
+def _records_from_attractions(df, name_col, city_col, desc_col, img_col, price_col, limit=12, map_col=None, open_col=None, close_col=None):
     records = []
-    if df.empty or name_col not in df.columns:
+    if df.empty:
+        return records
+    cmap = _colmap(df)
+    real_name_col = cmap.get(name_col.lower())
+    if real_name_col is None:
         return records
     for _, row in df.head(limit).iterrows():
-        name = _clean(row.get(name_col), 90)
-        raw_img = row.get(img_col) if img_col in df.columns else ""
+        name = _clean(row.get(real_name_col), 90)
+        raw_img = _pick(row, cmap, img_col) if img_col else None
+        hours = "Not Available"
+        if open_col and close_col:
+            open_v, close_v = _pick(row, cmap, open_col), _pick(row, cmap, close_col)
+            if open_v is not None and close_v is not None:
+                hours = f"{open_v} \u2013 {close_v}"
         records.append({
             "name": name,
-            "city": _clean(row.get(city_col), 60) if city_col in df.columns else "Egypt",
-            "desc": _clean(row.get(desc_col), 260) if desc_col in df.columns else "",
-            "url": _safe_image(str(raw_img) if pd.notna(raw_img) else "", name, ATTRACTION_FALLBACK_IMAGES),
-            "price": _clean(row.get(price_col), 150) if price_col in df.columns else "N/A",
+            "city": _clean(_pick(row, cmap, city_col), 60) or "Egypt",
+            "desc": _clean(_pick(row, cmap, desc_col), 260),
+            "url": _safe_image(str(raw_img) if raw_img is not None else "", name, ATTRACTION_FALLBACK_IMAGES),
+            "price": _clean(_pick(row, cmap, price_col), 150) if price_col else "N/A",
+            "link": _clean(_pick(row, cmap, map_col), 400) if map_col else "",
+            "hours": hours,
         })
     return records
 
 
 # ───────────────────────── Dataset retrieval (structured picks) ─────────────────────────
+
+def _maps_search_link(name, city):
+    """Fallback 'Directions' link for rows whose dataset entry has no
+    gmaps/website URL filled in. A plain Google Maps text search still gets
+    the traveler there, instead of the card silently losing its Directions
+    button whenever that one column happens to be empty."""
+    if not name:
+        return ""
+    query = f"{name}, {city}, Egypt" if city and city != "Egypt" else f"{name}, Egypt"
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
+
+
+def _rating_label(rating):
+    try:
+        r = float(rating)
+    except (TypeError, ValueError):
+        return ""
+    if r >= 4.5:
+        return "Excellent"
+    if r >= 4.0:
+        return "Very Good"
+    if r >= 3.5:
+        return "Good"
+    if r >= 3.0:
+        return "Average"
+    return "Below Average"
+
+
+def _load_ticket_prices():
+    """name (normalized) -> price string, from egymonuments_tickets.csv —
+    a dedicated ticket-pricing file that sits alongside the monuments data
+    but isn't joined into monuments_en.csv itself."""
+    df = _load_csv("egymonuments_tickets.csv")
+    if df.empty:
+        return {}
+    cmap = _colmap(df)
+    lookup = {}
+    for _, row in df.iterrows():
+        name = _pick(row, cmap, "monument", "place_name", "name", "site", "attraction", "location_name")
+        if name is None:
+            continue
+        price = _pick(
+            row, cmap,
+            "price", "ticket_price", "tickets_price", "foreigner_adult",
+            "adult_price", "foreigner_price", "entry_fee", "admission",
+        )
+        if price is None:
+            continue
+        lookup[_norm(str(name))] = _clean(price, 150)
+    return lookup
+
+
+def _records_from_beaches(df, num_beaches):
+    records = []
+    if df.empty:
+        return records
+    cmap = _colmap(df)
+    rating_col = cmap.get("rating") or cmap.get("rating_score") or cmap.get("stars")
+    if rating_col:
+        df = df.sort_values(rating_col, ascending=False)
+    for _, row in df.head(max(8, num_beaches)).iterrows():
+        name = _clean(_pick(row, cmap, "name", "beach_name", "place_name"), 90) or "Local beach"
+        city_val = _clean(_pick(row, cmap, "governorate", "city", "government"), 60) or "Egypt"
+        rating_val = _pick(row, cmap, "rating", "rating_score", "stars")
+        raw_img = _pick(row, cmap, "photo_url", "image_url", "image", "photo")
+        records.append({
+            "name": name,
+            "city": city_val,
+            "desc": f"⭐ {rating_val} · {_rating_label(rating_val)}".strip(" ·") if rating_val is not None else "Coastal spot",
+            "url": str(raw_img).strip() if raw_img is not None and _is_valid_image_url(str(raw_img)) else "",
+            "price": "Free",
+            "link": _clean(_pick(row, cmap, "maps_url", "gmaps_url", "map_link", "google_maps_url", "url", "link"), 400),
+        })
+    return records
+
 
 def _retrieve_dataset_content(data):
     cities = data.get("cities", [])
@@ -366,6 +469,19 @@ def _retrieve_dataset_content(data):
     sites_df, _ = _filter_city(_load_csv("Ancient_Sites_En.csv"), ["government", "place_name"], cities, destination)
     monuments_df, _ = _filter_city(_load_csv("monuments_en.csv"), ["location", "monument"], cities, destination)
     museums_df, _ = _filter_city(_load_csv("museums_en.csv"), ["location", "museum"], cities, destination)
+    raw_beaches_df = _load_csv("kemet_beaches_data.csv")
+    beaches_df, beaches_matched = _filter_city(raw_beaches_df, ["governorate", "city", "name"], cities, destination)
+    beaches_note = ""
+    num_beaches = int(data.get("num_beaches", 4))
+    if beaches_df.empty and not raw_beaches_df.empty and num_beaches > 0:
+        beaches_note = "No beaches found for this city in our dataset yet — showing top-rated picks across Egypt instead."
+        beaches_df = raw_beaches_df
+    elif not beaches_matched:
+        beaches_note = "Exact-city matches were limited, so this list also includes nearby-region picks."
+    if num_beaches > 0 and len(beaches_df) < num_beaches:
+        beaches_df, topped_beaches = _top_up_rows(beaches_df, [raw_beaches_df], num_beaches)
+        if topped_beaches and not beaches_note:
+            beaches_note = "Your chosen city didn't have enough beaches in our dataset, so this list also includes other highly-rated coastal picks."
 
     raw_restaurants_df = _load_csv("restaurants_gmaps.csv")
     restaurants_df, restaurants_matched = _filter_city(
@@ -389,80 +505,143 @@ def _retrieve_dataset_content(data):
     elif not hotels_matched:
         hotels_note = "Exact-city matches were limited, so this list also includes nearby-region picks."
 
-    attraction_pool = []
-    if any(i in data["interests"] for i in ["History", "Adventure", "Religious Heritage"]):
-        attraction_pool += _records_from_attractions(sites_df, "place_name", "government", "description", "image_url", None, 12)
-        attraction_pool += _records_from_attractions(monuments_df, "monument", "location", "Description", "photo_url", "tickets_price", 12)
-    if any(i in data["interests"] for i in ["Museums", "Culture", "History"]):
-        attraction_pool += _records_from_attractions(museums_df, "museum", "location", "Description", "photo_url", "tickets_price", 10)
+    ticket_prices = _load_ticket_prices()
 
-    if not attraction_pool:
-        attraction_pool += _records_from_attractions(sites_df, "place_name", "government", "description", "image_url", None, 8)
+    def _apply_ticket_price(records):
+        for r in records:
+            if r["price"] in ("N/A", "", "Price details not available."):
+                match = ticket_prices.get(_norm(r["name"]))
+                if match:
+                    r["price"] = match
+        return records
+
+    sites_list = _apply_ticket_price(
+        _records_from_attractions(sites_df, "place_name", "government", "description", "image_url", None, 8, map_col="map", open_col="open", close_col="close")
+    )
+    monuments_list = _apply_ticket_price(
+        _records_from_attractions(monuments_df, "monument", "location", "Description", "photo_url", "tickets_price", 8, map_col="on_map", open_col="start_from", close_col="end_at")
+    )
+    museums_list = _records_from_attractions(museums_df, "museum", "location", "Description", "photo_url", "tickets_price", 8, map_col="on_map", open_col="start_from", close_col="end_at")
+    beaches_list = _records_from_beaches(beaches_df, num_beaches)
 
     food = []
     if not restaurants_df.empty:
-        backup_rest_df = restaurants_df.copy()
-        if "rating" in restaurants_df.columns:
-            restaurants_df = restaurants_df.sort_values("rating", ascending=False)
-            backup_rest_df = backup_rest_df.sort_values("rating", ascending=False)
+        rest_cmap = _colmap(restaurants_df)
+        rating_col = rest_cmap.get("rating") or rest_cmap.get("rating_score") or rest_cmap.get("stars")
+        price_col = rest_cmap.get("price_level") or rest_cmap.get("price_range") or rest_cmap.get("price")
 
-        if "price_level" in restaurants_df.columns:
+        backup_rest_df = restaurants_df.copy()
+        if rating_col:
+            restaurants_df = restaurants_df.sort_values(rating_col, ascending=False)
+            backup_rest_df = backup_rest_df.sort_values(rating_col, ascending=False)
+
+        if price_col:
             if budget == "Budget":
-                restaurants_df = restaurants_df[restaurants_df["price_level"].fillna("").str.contains(r"💸|E£|Budget", case=False, regex=True) | (restaurants_df["price_level"].isna())]
+                restaurants_df = restaurants_df[restaurants_df[price_col].fillna("").astype(str).str.contains(r"💸|E£|Budget|\$", case=False, regex=True) | (restaurants_df[price_col].isna())]
             elif budget == "Luxury":
-                restaurants_df = restaurants_df[restaurants_df["price_level"].fillna("").str.contains(r"\$\$\$|\$\$\$\$|Expensive", case=False, regex=True) | (restaurants_df["price_level"].isna())]
+                restaurants_df = restaurants_df[restaurants_df[price_col].fillna("").astype(str).str.contains(r"\$\$\$|\$\$\$\$|Expensive", case=False, regex=True) | (restaurants_df[price_col].isna())]
 
         if restaurants_df.empty:
             restaurants_df = backup_rest_df
 
+        # Exact city+budget match might have far fewer rows than the person
+        # asked for — backfill first from the same city (ignoring budget
+        # tier), then from the whole dataset, before giving up on the count.
+        target_restaurants = max(num_restaurants, 1)
+        restaurants_df, topped_restaurants = _top_up_rows(
+            restaurants_df, [backup_rest_df, raw_restaurants_df], target_restaurants
+        )
+        if topped_restaurants and not restaurants_note:
+            restaurants_note = "Exact-match picks for your city/budget were limited, so this list also includes other highly-rated restaurants nearby."
+
         for _, row in restaurants_df.head(max(12, num_restaurants)).iterrows():
-            r_name = _clean(row.get("original_name") or row.get("gmaps_name"), 90)
-            img_idx = hash(r_name) % len(RESTAURANT_IMAGES)
+            r_name = _clean(_pick(row, rest_cmap, "original_name", "gmaps_name", "name", "restaurant_name", "place_name"), 90) or "Local restaurant"
+            city_val = _clean(_pick(row, rest_cmap, "governorate", "city", "government"), 60) or "Egypt"
+            # لو مفيش عمود صورة حقيقي، الأفضل مانعرضش صورة خالص بدل ما نعرض
+            # صورة ستوك عشوائية بتوهم إنها صورة المطعم الحقيقية.
+            raw_img = _pick(row, rest_cmap, "photo_url", "image_url", "image", "photo", "photo_reference")
+            rating_val = _pick(row, rest_cmap, "rating", "rating_score", "stars")
+            phone_val = _clean(_pick(row, rest_cmap, "phone", "phone_number", "tel", "contact_number", "contact"), 40)
+            address_val = _clean(_pick(row, rest_cmap, "address", "formatted_address", "full_address", "street_address", "vicinity"), 160)
+            try:
+                rating_num = float(rating_val) if rating_val is not None else None
+            except (TypeError, ValueError):
+                rating_num = None
             food.append({
                 "name": r_name,
-                "city": _clean(row.get("governorate") or row.get("city"), 60),
-                "desc": _clean(row.get("category"), 120),
-                "url": RESTAURANT_IMAGES[img_idx],
-                "price": _clean(row.get("price_level"), 80) or "Local Pricing",
-                "link": _clean(row.get("gmaps_url"), 400),
+                "city": city_val,
+                "desc": _clean(_pick(row, rest_cmap, "category", "type", "cuisine"), 120),
+                "url": str(raw_img).strip() if raw_img is not None and _is_valid_image_url(str(raw_img)) else "",
+                "price": _clean(_pick(row, rest_cmap, "price_level", "price_range", "price", "price_tier", "avg_price", "cost"), 80) or "Local Pricing",
+                "link": _clean(_pick(row, rest_cmap, "gmaps_url", "maps_url", "google_maps_url", "map_link", "location_url", "website", "url", "link"), 400) or _maps_search_link(r_name, city_val),
+                "rating": rating_num,
+                "rating_label": _rating_label(rating_num) if rating_num is not None else "",
+                "phone": phone_val,
+                "address": address_val,
             })
+
+    hotel_cmap = _colmap(hotels_df) if not hotels_df.empty else {}
+    hotel_price_col = hotel_cmap.get("price_egp") or hotel_cmap.get("price") or hotel_cmap.get("price_per_night")
+    hotel_rating_col = hotel_cmap.get("rating_score") or hotel_cmap.get("rating") or hotel_cmap.get("stars")
 
     if not hotels_df.empty:
         backup_hotels_df = hotels_df.copy()
-        if "Price_EGP" in hotels_df.columns:
+        if hotel_price_col:
+            prices = pd.to_numeric(hotels_df[hotel_price_col], errors="coerce")
             if budget == "Budget":
-                hotels_df = hotels_df[hotels_df["Price_EGP"] < 3000].sort_values("Rating_Score", ascending=False)
+                hotels_df = hotels_df[prices < 3000]
             elif budget == "Comfort":
-                hotels_df = hotels_df[(hotels_df["Price_EGP"] >= 3000) & (hotels_df["Price_EGP"] <= 7000)].sort_values("Rating_Score", ascending=False)
+                hotels_df = hotels_df[(prices >= 3000) & (prices <= 7000)]
             else:
-                hotels_df = hotels_df[hotels_df["Price_EGP"] > 7000].sort_values("Rating_Score", ascending=False)
-        elif "Rating_Score" in hotels_df.columns:
-            hotels_df = hotels_df.sort_values("Rating_Score", ascending=False)
+                hotels_df = hotels_df[prices > 7000]
+            if hotel_rating_col:
+                hotels_df = hotels_df.sort_values(hotel_rating_col, ascending=False)
+        elif hotel_rating_col:
+            hotels_df = hotels_df.sort_values(hotel_rating_col, ascending=False)
 
         if hotels_df.empty:
-            hotels_df = backup_hotels_df.sort_values("Rating_Score", ascending=False) if "Rating_Score" in backup_hotels_df.columns else backup_hotels_df
+            hotels_df = backup_hotels_df.sort_values(hotel_rating_col, ascending=False) if hotel_rating_col else backup_hotels_df
+
+        # Same idea as restaurants: don't silently return fewer hotels than
+        # requested just because the exact price band narrowed things down —
+        # backfill from the same city first, then from anywhere in Egypt.
+        target_hotels = max(num_hotels, 1)
+        hotels_df, topped_hotels = _top_up_rows(hotels_df, [backup_hotels_df, raw_hotels_df], target_hotels)
+        if topped_hotels and not hotels_note:
+            hotels_note = "Exact-match picks for your city/budget were limited, so this list also includes other highly-rated stays nearby."
 
     stays = []
     if not hotels_df.empty:
         for _, row in hotels_df.head(max(10, num_hotels)).iterrows():
-            price_val = f"EGP {int(row['Price_EGP'])} / night" if "Price_EGP" in row and pd.notna(row["Price_EGP"]) else "Contact for Rates"
-            h_name = _clean(row.get("Place_Name"), 90)
-            raw_img = row.get("Image")
+            h_name = _clean(_pick(row, hotel_cmap, "place_name", "name", "hotel_name"), 90) or "Local hotel"
+            city_val = _clean(_pick(row, hotel_cmap, "city", "governorate", "government"), 60) or "Egypt"
+            rating_val = _pick(row, hotel_cmap, "rating_score", "rating", "stars")
+            room_val = _pick(row, hotel_cmap, "room_info", "room_type", "amenities")
+            raw_img = _pick(row, hotel_cmap, "image", "photo_url", "image_url")
+            price_num = _pick(row, hotel_cmap, "price_egp", "price", "price_per_night")
+            try:
+                price_val = f"EGP {int(float(price_num))} / night" if price_num is not None else "Contact for Rates"
+            except (TypeError, ValueError):
+                price_val = "Contact for Rates"
             stays.append({
                 "name": h_name,
-                "city": _clean(row.get("city"), 60),
-                "desc": f"⭐ {row.get('Rating_Score', 'Rated')} · {clean_hours(str(row.get('Room_Info', 'Value Room')))}",
-                "url": _safe_image(str(raw_img) if pd.notna(raw_img) else "", h_name, HOTEL_FALLBACK_IMAGES),
+                "city": city_val,
+                "desc": f"⭐ {rating_val or 'Rated'} · {clean_hours(str(room_val or 'Value Room'))}",
+                "url": _safe_image(str(raw_img) if raw_img is not None else "", h_name, HOTEL_FALLBACK_IMAGES),
                 "price": price_val,
-                "link": _clean(row.get("Link"), 400),
+                "link": _clean(_pick(row, hotel_cmap, "link", "url", "booking_url"), 400),
             })
 
     return {
-        "attractions": attraction_pool,
+        "sites": sites_list,
+        "monuments": monuments_list,
+        "museums": museums_list,
+        "beaches": beaches_list,
         "restaurants": food,
         "hotels": stays,
         "restaurants_note": restaurants_note,
         "hotels_note": hotels_note,
+        "beaches_note": beaches_note,
     }
 
 
@@ -489,8 +668,12 @@ def _tips(data):
 
 def _source_badges(retrieved):
     badges = []
-    if retrieved["attractions"]:
+    if retrieved["sites"] or retrieved["monuments"]:
         badges.append("Verified Monuments & Heritage Sites")
+    if retrieved["museums"]:
+        badges.append("Museum Collections Index")
+    if retrieved["beaches"]:
+        badges.append("Coastal & Beach Ratings")
     if retrieved["restaurants"]:
         badges.append("Curated Restaurants Ledger")
     if retrieved["hotels"]:
@@ -555,7 +738,7 @@ def _generate_ai_narrative(data, retrieved):
     except Exception:
         rag_context = ""
 
-    picked_names = ", ".join(a["name"] for a in retrieved["attractions"][:4])
+    picked_names = ", ".join(a["name"] for a in (retrieved["sites"] + retrieved["monuments"] + retrieved["museums"])[:4])
     prompt = f"""You are KEMET, an Egypt tourism planning assistant.
 Using the dataset excerpts below (retrieved from KEMET's own hotels/restaurants/museums/monuments/sites data),
 write a short JSON object with:
@@ -651,20 +834,24 @@ def build_plan(raw_data):
         data["days"] = 5
 
     retrieved = _retrieve_dataset_content(data)
-    attractions = retrieved["attractions"] or [{
-        "name": "Local heritage walk", "city": data.get("destination") or "Egypt",
-        "desc": "A flexible exploration block based on your selected area.", "url": "", "price": "Free",
-    }]
+    combined_attractions = retrieved["sites"] + retrieved["monuments"] + retrieved["museums"]
+    if not combined_attractions:
+        combined_attractions = [{
+            "name": "Local heritage walk", "city": data.get("destination") or "Egypt",
+            "desc": "A flexible exploration block based on your selected area.", "url": "", "price": "Free",
+            "link": "", "hours": "Not Available",
+        }]
     restaurants = retrieved["restaurants"] or [{
         "name": "Local Egyptian restaurant", "city": data.get("destination") or "Egypt",
         "desc": "Traditional culinary area.",
-        "url": "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=600",
-        "price": "Standard Rate", "link": "",
+        "url": "",
+        "price": "Standard Rate", "link": "", "rating": None, "rating_label": "", "phone": "", "address": "",
     }]
     hotels = retrieved["hotels"]
+    beaches = retrieved["beaches"][:int(data.get("num_beaches", 4))]
 
     narrative = _generate_ai_narrative(data, retrieved)
-    days = _build_days(data, attractions, restaurants, narrative.get("day_notes"))
+    days = _build_days(data, combined_attractions, restaurants, narrative.get("day_notes"))
 
     daily = BUDGETS[data["budget"]]["daily"]
     low = daily * data["days"]
@@ -680,7 +867,10 @@ def build_plan(raw_data):
         "cities": data["cities"],
         "days": days,
         "budget": {"low": low, "high": high, "daily": daily, "note": "Estimate covers entry tickets, local transport buffers, and dining. Stays vary by season."},
-        "attractions": attractions,
+        "sites": retrieved["sites"],
+        "monuments": retrieved["monuments"],
+        "museums": retrieved["museums"],
+        "beaches": beaches,
         "restaurants": restaurants[:int(data.get("num_restaurants", 6))],
         "hotels": hotels[:int(data.get("num_hotels", 6))],
         "transport": data["transport"],
@@ -691,6 +881,7 @@ def build_plan(raw_data):
         "sources": _source_badges(retrieved),
         "restaurants_note": retrieved.get("restaurants_note", ""),
         "hotels_note": retrieved.get("hotels_note", ""),
+        "beaches_note": retrieved.get("beaches_note", ""),
         "rag_powered": bool(narrative.get("summary")),
     }
 

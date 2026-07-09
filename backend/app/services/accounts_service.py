@@ -105,6 +105,77 @@ def sign_up(username: str, email: str, password: str):
         return False, f"Error creating account: {e}"
 
 
+def google_sign_in(email: str, name: str, google_sub: str, picture: str = ""):
+    """Finds an existing account by email, or creates one, based on an
+    already-verified Google identity (the verification itself happens in
+    routes/account.py before this is called). Returns (success, user_dict).
+
+    Google accounts don't have a local password — PasswordHash is left
+    empty, which also means sign_in() with a password will correctly
+    reject them (bcrypt.checkpw against an empty hash fails safely)."""
+    container_users, _ = _get_containers()
+    email = (email or "").strip().lower()
+    if not email:
+        return False, "This Google account has no email address."
+
+    try:
+        query = "SELECT * FROM c WHERE c.Email = @email"
+        items = list(container_users.query_items(
+            query=query,
+            parameters=[{"name": "@email", "value": email}],
+            enable_cross_partition_query=True,
+        ))
+        user_doc = items[0] if items else None
+    except Exception as e:
+        return False, f"Error checking account: {e}"
+
+    if user_doc is not None:
+        # Existing account (created via password signup or a previous
+        # Google sign-in) — just log them in, and link the Google ID
+        # for reference if it isn't already linked.
+        if not user_doc.get("GoogleId"):
+            user_doc["GoogleId"] = google_sub
+            try:
+                container_users.upsert_item(body=user_doc)
+            except Exception:
+                pass
+        return True, {
+            "username": user_doc["Username"],
+            "email": user_doc.get("Email", ""),
+            "profile_pic_url": user_doc.get("ProfilePicUrl") or picture or "",
+        }
+
+    # First time we've seen this Google account — create a new user.
+    # Derive a username from their Google name/email, then make it unique.
+    base_username = "".join(ch for ch in (name or email.split("@")[0]) if ch.isalnum() or ch in "_-").strip("_-")
+    base_username = base_username or "user"
+    username = base_username
+    suffix = 1
+    while True:
+        try:
+            container_users.read_item(item=username, partition_key=username)
+        except exceptions.CosmosResourceNotFoundError:
+            break
+        except Exception as e:
+            return False, f"Error creating account: {e}"
+        suffix += 1
+        username = f"{base_username}{suffix}"
+
+    try:
+        new_user = {
+            "id": username,
+            "Username": username,
+            "Email": email,
+            "PasswordHash": "",
+            "GoogleId": google_sub,
+            "ProfilePicUrl": picture or "",
+        }
+        container_users.create_item(body=new_user)
+        return True, {"username": username, "email": email, "profile_pic_url": picture or ""}
+    except Exception as e:
+        return False, f"Error creating account: {e}"
+
+
 def sign_in(identifier: str, password: str):
     """identifier can be a username or an email. Returns (success, result)."""
     container_users, _ = _get_containers()

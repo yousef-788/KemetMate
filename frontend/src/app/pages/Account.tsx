@@ -377,9 +377,26 @@ function GoogleSignInButton({
     if (!GOOGLE_CLIENT_ID || !containerRef.current) return;
     let cancelled = false;
 
+    // Google's renderButton wants an exact pixel width (max 400) — a fixed
+    // number like 320 doesn't shrink on narrow phones and was pushing the
+    // whole card wider than the screen. We measure the actual container
+    // width instead, and re-render on resize to stay in sync.
+    const renderButton = () => {
+      if (cancelled || !containerRef.current || !window.google?.accounts?.id) return;
+      const measured = containerRef.current.offsetWidth;
+      const width = Math.max(200, Math.min(400, measured || 320));
+      window.google.accounts.id.renderButton(containerRef.current, {
+        theme: "filled_black",
+        size: "large",
+        shape: "pill",
+        text: "continue_with",
+        width,
+      });
+    };
+
     loadGoogleScript()
       .then(() => {
-        if (cancelled || !containerRef.current || !window.google?.accounts?.id) return;
+        if (cancelled || !window.google?.accounts?.id) return;
         window.google.accounts.id.initialize({
           client_id: GOOGLE_CLIENT_ID,
           callback: async (response: { credential: string }) => {
@@ -391,23 +408,19 @@ function GoogleSignInButton({
             }
           },
         });
-        window.google.accounts.id.renderButton(containerRef.current, {
-          theme: "filled_black",
-          size: "large",
-          shape: "pill",
-          text: "continue_with",
-          width: 320,
-        });
+        renderButton();
       })
       .catch((e) => onError(e instanceof Error ? e.message : "Google sign-in failed."));
 
+    window.addEventListener("resize", renderButton);
     return () => {
       cancelled = true;
+      window.removeEventListener("resize", renderButton);
     };
   }, [onLoggedIn, onError]);
 
   if (!GOOGLE_CLIENT_ID) return null;
-  return <div ref={containerRef} className="flex justify-center [&>div]:w-full" />;
+  return <div ref={containerRef} className="w-full flex justify-center overflow-hidden" />;
 }
 
 function OrDivider() {
@@ -759,7 +772,7 @@ function GuestMode({ onLoggedIn }: { onLoggedIn: (user: AccountUser) => void }) 
   };
 
   return (
-    <div className="flex" style={{ background: "#0A0B1E" }}>
+    <div className="flex overflow-x-hidden" style={{ background: "#0A0B1E" }}>
       <DecorativePanel />
       <div className="flex-1 flex flex-col items-center justify-center p-6 lg:p-12">
         <div className="w-full max-w-md bg-white/5 border border-white/10 rounded-2xl p-6 sm:p-8">
@@ -1395,7 +1408,7 @@ export function Account() {
   }
 
   return (
-    <div className="min-h-screen" style={{ background: "#0A0B1E" }}>
+    <div className="min-h-screen overflow-x-hidden" style={{ background: "#0A0B1E" }}>
       <TabBar active={tab} onChange={setTab} />
       <div className="p-4 md:p-8">
         {tab === "account" &&

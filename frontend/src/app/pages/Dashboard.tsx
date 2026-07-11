@@ -216,7 +216,7 @@ export function Dashboard() {
   const beachChartData = data ? [...data.kemet.beach_ratings_by_governorate].sort((a, b) => a.rating - b.rating) : [];
 
   return (
-    <div className="space-y-8">
+    <div className="max-w-[1400px] mx-auto space-y-8">
 
       {/* HERO — real photo of the Giza Pyramids, no stock placeholder */}
       <div className="relative rounded-3xl overflow-hidden border border-white/10 shadow-2xl">

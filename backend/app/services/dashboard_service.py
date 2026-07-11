@@ -352,6 +352,23 @@ def _format_year(year: int) -> str:
     return f"{abs(year)} BC" if year < 0 else f"{year} AD"
 
 
+# Google's own default pin/placeholder graphic — served whenever the scraper found a
+# listing on Google Maps that has no real uploaded photo. Filtering this out is a data-
+# quality step (not a code bug): the scrape correctly recorded what Google Maps actually
+# showed for that listing, which happened to be its generic "no photo" placeholder.
+_PLACEHOLDER_IMAGE_MARKERS = (
+    "gstatic.com/tactile/pane/default_geocode",  # Google Maps' generic pin/no-photo image
+    "maps.gstatic.com/mapfiles/",                 # other generic Maps UI graphics
+)
+
+
+def _is_placeholder_image(url) -> bool:
+    if not isinstance(url, str) or not url.strip():
+        return True
+    low = url.lower()
+    return any(marker in low for marker in _PLACEHOLDER_IMAGE_MARKERS)
+
+
 SPOTLIGHT_LIMIT = 12
 
 
@@ -364,6 +381,7 @@ def get_spotlight_beaches(limit: int = SPOTLIGHT_LIMIT) -> list[dict]:
     df = beaches.merge(governorates, on="governorate_key", how="left") if not governorates.empty else beaches
     df = df.dropna(subset=["photo_url", "name"])
     df = df[df["photo_url"].astype(str).str.strip() != ""]
+    df = df[~df["photo_url"].apply(_is_placeholder_image)]
     if "rating" in df.columns:
         df = df.sort_values("rating", ascending=False)
     df = df.head(limit)
@@ -385,6 +403,7 @@ def get_spotlight_restaurants(limit: int = SPOTLIGHT_LIMIT) -> list[dict]:
     df = restaurants.merge(governorates, on="governorate_key", how="left") if not governorates.empty else restaurants
     df = df.dropna(subset=["photo_url", "name"])
     df = df[df["photo_url"].astype(str).str.strip() != ""]
+    df = df[~df["photo_url"].apply(_is_placeholder_image)]
     if "rating" in df.columns:
         df = df.sort_values("rating", ascending=False)
     df = df.head(limit)
@@ -409,6 +428,7 @@ def get_spotlight_hotels(limit: int = SPOTLIGHT_LIMIT) -> list[dict]:
         df = df.merge(tiers, on="tier_key", how="left")
     df = df.dropna(subset=["image", "name"])
     df = df[df["image"].astype(str).str.strip() != ""]
+    df = df[~df["image"].apply(_is_placeholder_image)]
     if "rating_score" in df.columns:
         df = df.sort_values("rating_score", ascending=False)
     df = df.head(limit)
@@ -434,6 +454,7 @@ def _spotlight_attractions_by_type(type_name: str, limit: int = SPOTLIGHT_LIMIT)
     df = df[df["type_name"] == type_name]
     df = df.dropna(subset=["image_url", "place_name"])
     df = df[df["image_url"].astype(str).str.strip() != ""]
+    df = df[~df["image_url"].apply(_is_placeholder_image)]
     df = df.head(limit)
     out = []
     for _, r in df.iterrows():

@@ -354,6 +354,16 @@ function PeriodStoryView({
   const color = colorFor(index);
   const isLeft = index % 2 === 0;
 
+  // Tracks whether the current slide's hero image has actually finished
+  // loading, so we can show a soft pulse placeholder instead of a blank
+  // box while it's still fetching (the preload effect below usually makes
+  // this instant, but it covers the case where someone jumps straight to
+  // Story Mode before the background preload has caught up).
+  const [imgLoaded, setImgLoaded] = useState(false);
+  useEffect(() => {
+    setImgLoaded(false);
+  }, [index]);
+
   const go = (delta: number) => {
     setIndex((i) => (i + delta + total) % total);
   };
@@ -444,21 +454,31 @@ function PeriodStoryView({
             }}
           >
             <div
-              className="rounded-3xl overflow-hidden border"
+              className="rounded-3xl overflow-hidden border relative"
               style={{
                 borderColor: `${color}55`,
                 boxShadow: `0 0 0 1px rgba(255,255,255,0.04), 0 20px 60px -20px ${color}55`,
               }}
             >
+              {!imgLoaded && (
+                <div
+                  className="absolute inset-0 animate-pulse"
+                  style={{ background: `linear-gradient(135deg, ${color}22, rgba(255,255,255,0.04))` }}
+                />
+              )}
               <img
                 src={sharpImg(curatedImg(period) ?? period.img, 1400)}
                 alt={period.name}
                 loading="eager"
                 decoding="async"
+                onLoad={() => setImgLoaded(true)}
                 onError={(e) => {
+                  setImgLoaded(true);
                   (e.currentTarget as HTMLImageElement).src = FALLBACK_IMG;
                 }}
-                className="w-full h-64 md:h-[26rem] object-cover"
+                className={`w-full h-64 md:h-[26rem] object-cover relative transition-opacity duration-300 ${
+                  imgLoaded ? "opacity-100" : "opacity-0"
+                }`}
               />
             </div>
           </div>
@@ -644,6 +664,28 @@ export function HistoricalPeriods() {
       cancelled = true;
     };
   }, []);
+
+  // Preload every period's image the moment the list itself has loaded —
+  // not lazily as each card scrolls into view, and not only when Story
+  // Mode is opened. This is what actually fixes the "blank box until you
+  // reach it" delay: by the time the person scrolls down or taps into
+  // Story Mode, the image is already sitting in the browser's cache.
+  // Fire-and-forget `Image()` objects — no state, no re-render, and if one
+  // fails it just never resolves (the real <img> tags still have their
+  // own onError -> FALLBACK_IMG handling).
+  useEffect(() => {
+    if (!data) return;
+    data.periods.forEach((p) => {
+      const src = curatedImg(p) ?? p.img;
+      if (!src) return;
+      // Card thumbnail size and the larger Story Mode size both get
+      // requested up front so neither view has to wait later.
+      [700, 1400].forEach((width) => {
+        const img = new Image();
+        img.src = sharpImg(src, width);
+      });
+    });
+  }, [data]);
 
   const filtered = useMemo(() => {
     if (!data) return [];

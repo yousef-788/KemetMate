@@ -198,10 +198,11 @@ function GuestNameModal({ onSubmit, onCancel }: { onSubmit: (name: string) => vo
 }
 
 const PostCard = memo(function PostCard({
-  post, identity, onChanged, onDeleted, requireIdentity,
+  post, identity, myProfilePicUrl, onChanged, onDeleted, requireIdentity,
 }: {
   post: Post;
   identity: { name: string; loggedIn: boolean };
+  myProfilePicUrl: string | null;
   onChanged: (updated: Post) => void;
   onDeleted: (owner: string, idx: number) => void;
   requireIdentity: (action: () => void) => void;
@@ -388,7 +389,7 @@ const PostCard = memo(function PostCard({
           ))}
 
           <div className="flex gap-3 mt-2">
-            <Avatar name={identity.name || "?"} size="sm" />
+            <Avatar name={identity.name || "?"} imageUrl={myProfilePicUrl} size="sm" />
             <div className="flex-1 flex gap-2">
               <input
                 value={commentText}
@@ -527,6 +528,17 @@ export function Community() {
     return p.owner_username.toLowerCase().includes(searchQuery.toLowerCase());
   });
 
+  // `identity` only carries {name, loggedIn} straight from the JWT — it never
+  // had a profile picture. So every "this is me" avatar (composer, comment
+  // box) was always falling back to initials, even for users who *do* have a
+  // profile pic, since none of the Avatar calls for "me" ever got an
+  // imageUrl. We recover it here from posts already on screen: any post
+  // authored by the current identity carries their real profile_pic_url.
+  const myProfilePicUrl = useMemo(() => {
+    const mine = posts.find((p) => p.owner_username === identity.name);
+    return mine?.profile_pic_url || null;
+  }, [posts, identity.name]);
+
   // Top 10 most active travelers, ranked purely by how many posts they've
   // shared — real data straight from what's already loaded, no fake numbers.
   const topTravelers = useMemo(() => {
@@ -614,7 +626,7 @@ export function Community() {
               onClick={() => setComposerOpen(true)}
               className="w-full bg-white/5 border border-white/10 hover:border-[#D4AF37]/30 rounded-2xl p-4 flex items-center gap-3 transition-all group text-left"
             >
-              <Avatar name={identity.name || "?"} size="md" />
+              <Avatar name={identity.name || "?"} imageUrl={myProfilePicUrl} size="md" />
               <span className="text-gray-500 group-hover:text-gray-400 text-sm transition-colors flex-1">
                 {"What's your Egypt story? Share it with the community..."}
               </span>
@@ -627,7 +639,7 @@ export function Community() {
             <div className="bg-white/5 backdrop-blur-sm border border-[#D4AF37]/30 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <Avatar name={identity.name || "?"} size="md" />
+                  <Avatar name={identity.name || "?"} imageUrl={myProfilePicUrl} size="md" />
                   <div>
                     <p className="text-sm font-semibold text-white">Share Your Experience</p>
                     <p className="text-xs text-gray-400">
@@ -713,6 +725,7 @@ export function Community() {
                 key={`${post.owner_username}-${post.content_index}`}
                 post={post}
                 identity={identity}
+                myProfilePicUrl={myProfilePicUrl}
                 onChanged={updatePostInList}
                 onDeleted={removePostFromList}
                 requireIdentity={requireIdentity}

@@ -305,9 +305,22 @@ def get_reply(user_input, mode="Chat", model_choice="Flash", rate_limit_key="glo
     model_id = MODELS.get(model_choice, MODELS["Flash"])
 
     try:
+        # الداتا المسترجعة (Data mode) أو نتايج البحث (Web Search) غالبًا بتكون
+        # عربي أو خليط عربي/إنجليزي، وده كان بيخلي Gemini يرد بالعربي حتى لو
+        # سؤال المستخدم كان بالإنجليزي. بنضيف تعليمة صريحة إنه يرد بنفس لغة
+        # السؤال (مش لغة الـ context) عشان نمنع المشكلة دي في كل الـ modes.
+        LANGUAGE_INSTRUCTION = (
+            "IMPORTANT: Reply in the SAME language the user used to ask their "
+            "question (e.g. if they asked in English, reply in English; if in "
+            "Arabic, reply in Arabic), regardless of what language the "
+            "reference data/search results below are written in."
+        )
+
         if mode == "Data":
             relevant_context = retrieve_relevant_chunks(user_input)
             prompt = f"""You are KEMET, an intelligent Egypt tourism assistant.
+{LANGUAGE_INSTRUCTION}
+
 Answer the user's question based on the following relevant excerpts from the data
 (these are the most relevant sections retrieved for this specific question, not the full dataset).
 
@@ -321,6 +334,8 @@ Question: {user_input}"""
         elif mode == "Web Search":
             web_context = search_web(user_input)
             prompt = f"""You are KEMET, a helpful AI assistant.
+{LANGUAGE_INSTRUCTION}
+
 Answer the user's question based on these web search results.
 If the results don't contain the answer, say so honestly.
 
@@ -334,7 +349,7 @@ Question: {user_input}"""
         else:  # Chat
             response = _call_gemini(
                 model=model_id,
-                contents=f"You are KEMET, an AI guide for Egypt tourism. {user_input}",
+                contents=f"You are KEMET, an AI guide for Egypt tourism. {LANGUAGE_INSTRUCTION} {user_input}",
                 config=types.GenerateContentConfig(tools=[{"google_search": {}}]),
             )
             reply = response.text

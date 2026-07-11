@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from "react";
+import type { CSSProperties } from "react";
 import {
   Shuffle,
   Calendar,
@@ -212,6 +213,27 @@ const STORY_KEYFRAMES = `
 }
 .story-fade-bg { animation: storyFadeIn 0.25s ease-out; }
 @keyframes storyFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* Slim custom scrollbar for the description text, replacing the bulky
+   default browser scrollbar with a thin rounded accent-colored thread. */
+.story-desc-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--story-accent, #D4AF37) transparent;
+}
+.story-desc-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.story-desc-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.story-desc-scroll::-webkit-scrollbar-thumb {
+  background: var(--story-accent, #D4AF37);
+  border-radius: 9999px;
+}
+.story-desc-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--story-accent, #D4AF37);
+  opacity: 0.8;
+}
 `;
 
 // Full-screen, one-period-at-a-time presentation. Image and text swap sides
@@ -308,18 +330,14 @@ function PeriodStoryView({
         </button>
       </div>
 
-      <span className="absolute bottom-8 left-6 md:left-8 z-20 text-white/25 text-xs tracking-wide hidden sm:block">
-        Tap outside to close
-      </span>
-
-      {/* Slide content — clicks here are "inside" and shouldn't close the view */}
-      <div
-        className="h-full w-full flex items-center justify-center px-5 md:px-16 pt-16 pb-28 cursor-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
+      {/* Slide content — the padded wrapper itself counts as "outside" so
+          clicks in the empty space around the image/text still close the
+          view; only the tight image+text row below stops propagation. */}
+      <div className="h-full w-full flex items-center justify-center px-5 md:px-16 pt-16 pb-28">
         <div
           key={period.name}
-          className={`w-full max-w-5xl flex flex-col ${
+          onClick={(e) => e.stopPropagation()}
+          className={`w-full max-w-5xl flex flex-col cursor-auto ${
             isLeft ? "md:flex-row" : "md:flex-row-reverse"
           } items-center gap-8 md:gap-14`}
         >
@@ -368,7 +386,10 @@ function PeriodStoryView({
             <h2 className="text-2xl md:text-4xl font-bold text-white mb-4 leading-tight">
               {period.name}
             </h2>
-            <p className="text-white/70 text-sm md:text-base leading-relaxed whitespace-pre-line max-h-[40vh] overflow-y-auto pr-2">
+            <p
+              className="story-desc-scroll text-white/70 text-sm md:text-base leading-relaxed whitespace-pre-line max-h-[40vh] overflow-y-auto pr-3"
+              style={{ "--story-accent": color } as CSSProperties}
+            >
               {period.desc}
             </p>
           </div>

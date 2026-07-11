@@ -94,11 +94,6 @@ const APP_ICONS: Record<string, typeof Car> = {
   map: MapPinned,
 };
 
-// '−2686' -> '2686 BC', '332' -> '332 AD' — matches how Silver already signs BC years.
-function formatYear(year: number): string {
-  return year < 0 ? `${Math.abs(year)} BC` : `${year} AD`;
-}
-
 // Real, stable photography (Wikimedia Commons) — used only for the hero background.
 // Every other image on this page (the rotating "Discover Egypt" cards below) comes
 // from real KEMET Storage data (fact_beaches.photo_url, fact_hotels.image, etc.),
@@ -206,9 +201,6 @@ export function Dashboard() {
 
   const tempChartData = [...validTemps].sort((a, b) => a.temperature! - b.temperature!);
   const humChartData = [...validHum].sort((a, b) => a.humidity! - b.humidity!);
-
-  // Gold-derived chart data, sorted for readability in their chart orientation
-  const historyChartData = data ? [...data.kemet.historical_timeline].sort((a, b) => a.start_year - b.start_year) : [];
 
   return (
     <div className="w-full max-w-[1400px] mx-auto space-y-8 px-4 sm:px-6 lg:px-8 box-border">
@@ -401,55 +393,6 @@ export function Dashboard() {
               </div>
             </div>
           </div>
-
-          {/* 5,000 YEARS OF HISTORY — Gantt-style horizontal timeline chart */}
-          {data.kemet.historical_timeline.length > 0 && (
-            <div className="bg-white/5 backdrop-blur-sm rounded-3xl p-4 sm:p-5 border border-white/10 hover:border-[#D4AF37]/20 transition-all max-w-3xl mx-auto">
-              <h3 className="text-lg font-semibold text-gray-100 mb-1">5,000 Years of History</h3>
-              <p className="text-[11px] text-gray-500 mb-4">
-                {data.kemet.national_stats
-                  ? `${data.kemet.national_stats.archaeological_sites.toLocaleString()} archaeological sites and ${data.kemet.national_stats.museums} museums preserve every one of these periods`
-                  : "Every era, from the Old Kingdom to the present day"}
-              </p>
-              <ResponsiveContainer width="100%" height={Math.max(180, historyChartData.length * 34)}>
-                <BarChart data={historyChartData} layout="vertical" margin={{ left: 4, right: 16 }} barCategoryGap="25%">
-                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
-                  <XAxis
-                    type="number"
-                    domain={["dataMin", "dataMax"]}
-                    stroke="#94a3b8"
-                    style={{ fontSize: "10px" }}
-                    tickFormatter={(v: number) => formatYear(v)}
-                  />
-                  <YAxis type="category" dataKey="period" stroke="#94a3b8" style={{ fontSize: "10px" }} width={110} />
-                  <Tooltip
-                    cursor={{ fill: "rgba(255,255,255,0.04)" }}
-                    content={({ active, payload }) => {
-                      if (!active || !payload || !payload.length) return null;
-                      const p = payload[0].payload as HistoricalPeriod;
-                      return (
-                        <div className="bg-[#0A0B1E] border border-[#D4AF37] rounded-xl px-3 py-2">
-                          <p className="text-white text-xs font-semibold mb-1">{p.period}</p>
-                          <p className="text-[#D4AF37] text-xs">{formatYear(p.start_year)} – {formatYear(p.end_year)}</p>
-                          <p className="text-gray-400 text-[11px] mt-0.5">{p.duration_years.toLocaleString()} years</p>
-                        </div>
-                      );
-                    }}
-                  />
-                  {/* Invisible spacer bar pushes the visible bar out to start_year, creating the Gantt effect */}
-                  <Bar dataKey="start_year" stackId="timeline" fill="transparent" />
-                  <Bar dataKey="duration_years" stackId="timeline" radius={[0, 6, 6, 0]} fill="#dfb257" maxBarSize={16}>
-                    <LabelList
-                      dataKey="duration_years"
-                      position="insideRight"
-                      formatter={(v: number) => `${v.toLocaleString()}y`}
-                      style={{ fill: "#000000", fontWeight: 700, fontSize: 9 }}
-                    />
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
 
           {/* LIVE WEATHER — بيانات حية */}
           <div>

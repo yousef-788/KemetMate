@@ -10,6 +10,9 @@ import {
   X,
   BookOpenText,
 } from "lucide-react";
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList,
+} from "recharts";
 import { API_BASE_URL } from "../lib/api";
 
 const API_URL = `${API_BASE_URL}/api/periods`;
@@ -18,6 +21,24 @@ const FALLBACK_IMG =
   "https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=1400&q=80&auto=format&fit=crop";
 
 const FACTS_API_URL = `${API_BASE_URL}/api/periods/facts`;
+
+// Same Gold-derived timeline data the Dashboard used to show — moved here
+// (full-width, at the bottom of the page) instead. /api/dashboard/kemet is
+// the lightweight bundle endpoint: just the Gold-derived data, no live
+// weather/currency calls, so this page doesn't pay for those.
+const TIMELINE_API_URL = `${API_BASE_URL}/api/dashboard/kemet`;
+
+interface HistoricalTimelinePeriod {
+  period: string;
+  start_year: number;
+  end_year: number;
+  duration_years: number;
+}
+
+// '−2686' -> '2686 BC', '332' -> '332 AD' — matches how Silver already signs BC years.
+function formatYear(year: number): string {
+  return year < 0 ? `${Math.abs(year)} BC` : `${year} AD`;
+}
 
 // The API images render blurry because they're served at a small fixed
 // width (often a ~600px thumbnail) then stretched to fill much larger
@@ -533,6 +554,8 @@ export function HistoricalPeriods() {
   const [factIndex, setFactIndex] = useState(0);
   const [factAnimating, setFactAnimating] = useState(false);
 
+  const [timeline, setTimeline] = useState<HistoricalTimelinePeriod[]>([]);
+
   const cycleFact = () => {
     if (facts.length < 2) return;
     setFactAnimating(true);
@@ -560,6 +583,28 @@ export function HistoricalPeriods() {
     }
 
     loadFacts();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadTimeline() {
+      try {
+        const res = await fetch(TIMELINE_API_URL);
+        if (!res.ok) return;
+        const json: { historical_timeline?: HistoricalTimelinePeriod[] } = await res.json();
+        if (!cancelled && Array.isArray(json.historical_timeline)) {
+          setTimeline([...json.historical_timeline].sort((a, b) => a.start_year - b.start_year));
+        }
+      } catch {
+        // Same as facts above — nice-to-have, don't surface an error state for it.
+      }
+    }
+
+    loadTimeline();
     return () => {
       cancelled = true;
     };
@@ -856,6 +901,57 @@ export function HistoricalPeriods() {
           </div>
         )}
       </div>
+
+      {/* 5,000 YEARS OF HISTORY — Gantt-style horizontal timeline chart.
+          Moved here from the Dashboard, full width instead of the old
+          max-w-3xl centered card. */}
+      {timeline.length > 0 && (
+        <div className="max-w-5xl mx-auto px-4 pb-16">
+          <div className="bg-white/5 backdrop-blur-sm rounded-3xl p-4 sm:p-6 border border-white/10 hover:border-[#D4AF37]/20 transition-all w-full">
+            <h3 className="text-lg sm:text-xl font-semibold text-gray-100 mb-1">5,000 Years of History</h3>
+            <p className="text-[11px] sm:text-xs text-gray-500 mb-4">
+              Every era, from the first villages along the Nile to modern Cairo
+            </p>
+            <ResponsiveContainer width="100%" height={Math.max(180, timeline.length * 34)}>
+              <BarChart data={timeline} layout="vertical" margin={{ left: 4, right: 16 }} barCategoryGap="25%">
+                <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
+                <XAxis
+                  type="number"
+                  domain={["dataMin", "dataMax"]}
+                  stroke="#94a3b8"
+                  style={{ fontSize: "10px" }}
+                  tickFormatter={(v: number) => formatYear(v)}
+                />
+                <YAxis type="category" dataKey="period" stroke="#94a3b8" style={{ fontSize: "10px" }} width={130} />
+                <Tooltip
+                  cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                  content={({ active, payload }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const p = payload[0].payload as HistoricalTimelinePeriod;
+                    return (
+                      <div className="bg-[#0A0B1E] border border-[#D4AF37] rounded-xl px-3 py-2">
+                        <p className="text-white text-xs font-semibold mb-1">{p.period}</p>
+                        <p className="text-[#D4AF37] text-xs">{formatYear(p.start_year)} – {formatYear(p.end_year)}</p>
+                        <p className="text-gray-400 text-[11px] mt-0.5">{p.duration_years.toLocaleString()} years</p>
+                      </div>
+                    );
+                  }}
+                />
+                {/* Invisible spacer bar pushes the visible bar out to start_year, creating the Gantt effect */}
+                <Bar dataKey="start_year" stackId="timeline" fill="transparent" />
+                <Bar dataKey="duration_years" stackId="timeline" radius={[0, 6, 6, 0]} fill="#dfb257" maxBarSize={18}>
+                  <LabelList
+                    dataKey="duration_years"
+                    position="insideRight"
+                    formatter={(v: number) => `${v.toLocaleString()}y`}
+                    style={{ fill: "#000000", fontWeight: 700, fontSize: 10 }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
 
       {storyOpen && filtered.length > 0 && (
         <PeriodStoryView

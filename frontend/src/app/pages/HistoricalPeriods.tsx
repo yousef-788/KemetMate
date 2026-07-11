@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import {
   Shuffle,
   Calendar,
@@ -6,7 +6,6 @@ import {
   ChevronDown,
   ChevronUp,
   ChevronLeft,
-  ChevronRight,
   X,
   BookOpenText,
 } from "lucide-react";
@@ -15,9 +14,30 @@ import { API_BASE_URL } from "../lib/api";
 const API_URL = `${API_BASE_URL}/api/periods`;
 
 const FALLBACK_IMG =
-  "https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600";
+  "https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=1400&q=80&auto=format&fit=crop";
 
 const FACTS_API_URL = `${API_BASE_URL}/api/periods/facts`;
+
+// The API images render blurry because they're served at a small fixed
+// width (often a ~600px thumbnail) then stretched to fill much larger
+// card/hero containers. When the source is an Unsplash URL we can just ask
+// for a bigger, better-compressed version instead of upscaling a small one.
+function sharpImg(url: string, width: number): string {
+  if (!url) return url;
+  try {
+    const u = new URL(url, "https://images.unsplash.com");
+    if (u.hostname.includes("unsplash.com")) {
+      u.searchParams.set("w", String(width));
+      u.searchParams.set("q", "80");
+      u.searchParams.set("auto", "format");
+      u.searchParams.set("fit", "crop");
+      return u.toString();
+    }
+    return url;
+  } catch {
+    return url;
+  }
+}
 
 const HIEROGLYPHS = ["𓂀", "𓆣", "𓇋", "𓅓", "𓊪", "𓏏", "𓋴"];
 
@@ -82,8 +102,10 @@ function PeriodCard({
       {!expanded && (
         <div className="relative h-40">
           <img
-            src={period.img}
+            src={sharpImg(period.img, 700)}
             alt={period.name}
+            loading="lazy"
+            decoding="async"
             onError={(e) => {
               (e.currentTarget as HTMLImageElement).src = FALLBACK_IMG;
             }}
@@ -113,8 +135,10 @@ function PeriodCard({
 
         {expanded && (
           <img
-            src={period.img}
+            src={sharpImg(period.img, 900)}
             alt={period.name}
+            loading="lazy"
+            decoding="async"
             onError={(e) => {
               (e.currentTarget as HTMLImageElement).src = FALLBACK_IMG;
             }}
@@ -130,17 +154,17 @@ function PeriodCard({
           {period.desc}
         </p>
 
-        <div className="mt-3 flex items-center justify-between">
+        <div className="mt-3 flex items-center justify-between gap-2">
           <span className="text-xs" style={{ color }}>
             {expanded ? "Show less" : "Read more"}
           </span>
-          {expanded && onOpenStory && (
+          {onOpenStory && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 onOpenStory();
               }}
-              className="text-xs font-semibold px-2.5 py-1 rounded-full transition-colors hover:brightness-110"
+              className="text-xs font-semibold px-2.5 py-1 rounded-full transition-colors hover:brightness-110 shrink-0"
               style={{ background: `${color}22`, color }}
             >
               View in Story Mode →
@@ -204,7 +228,7 @@ function PeriodStoryView({
   periods: PeriodRecord[];
   startIndex: number;
   colorFor: (i: number) => string;
-  onClose: () => void;
+  onClose: (index: number) => void;
 }) {
   const [index, setIndex] = useState(startIndex);
   const total = periods.length;
@@ -219,16 +243,23 @@ function PeriodStoryView({
   useEffect(() => {
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, []);
+
+  // Keep the escape/arrow-key handlers reading the latest index without
+  // having to re-bind the listener on every navigation.
+  const indexRef = useRef(index);
+  indexRef.current = index;
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onClose(indexRef.current);
       if (e.key === "ArrowRight" || e.key === "ArrowDown") go(1);
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") go(-1);
     };
     window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = prevOverflow;
-      window.removeEventListener("keydown", onKey);
-    };
+    return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [total]);
 
@@ -236,7 +267,8 @@ function PeriodStoryView({
 
   return (
     <div
-      className="fixed inset-0 z-50 story-fade-bg overflow-hidden"
+      className="fixed inset-0 z-50 story-fade-bg overflow-hidden cursor-pointer"
+      onClick={() => onClose(index)}
       style={{
         background:
           "radial-gradient(ellipse 90% 70% at 50% 0%, rgba(212,175,55,0.14) 0%, rgba(10,11,30,0) 65%), #0A0B1E",
@@ -254,7 +286,10 @@ function PeriodStoryView({
       />
 
       {/* Top bar: progress + close */}
-      <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-5 md:px-8 py-5 z-20">
+      <div
+        className="absolute top-0 left-0 right-0 flex items-center justify-between px-5 md:px-8 py-5 z-20 cursor-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div
           key={`badge-${index}`}
           className="flex items-center gap-2 text-xs font-semibold tracking-widest uppercase"
@@ -265,7 +300,7 @@ function PeriodStoryView({
           <span className="text-white/40">{String(total).padStart(2, "0")}</span>
         </div>
         <button
-          onClick={onClose}
+          onClick={() => onClose(index)}
           className="rounded-full p-2 text-white/60 hover:text-white hover:bg-white/10 transition-colors"
           aria-label="Close story mode"
         >
@@ -273,8 +308,15 @@ function PeriodStoryView({
         </button>
       </div>
 
-      {/* Slide content */}
-      <div className="h-full w-full flex items-center justify-center px-5 md:px-16 pt-16 pb-28">
+      <span className="absolute bottom-8 left-6 md:left-8 z-20 text-white/25 text-xs tracking-wide hidden sm:block">
+        Tap outside to close
+      </span>
+
+      {/* Slide content — clicks here are "inside" and shouldn't close the view */}
+      <div
+        className="h-full w-full flex items-center justify-center px-5 md:px-16 pt-16 pb-28 cursor-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div
           key={period.name}
           className={`w-full max-w-5xl flex flex-col ${
@@ -295,8 +337,10 @@ function PeriodStoryView({
               }}
             >
               <img
-                src={period.img}
+                src={sharpImg(period.img, 1400)}
                 alt={period.name}
+                loading="eager"
+                decoding="async"
                 onError={(e) => {
                   (e.currentTarget as HTMLImageElement).src = FALLBACK_IMG;
                 }}
@@ -332,7 +376,10 @@ function PeriodStoryView({
       </div>
 
       {/* Bottom-center navigation */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-3">
+      <div
+        className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-3 cursor-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center gap-5">
           <button
             onClick={() => go(-1)}
@@ -650,7 +697,11 @@ export function HistoricalPeriods() {
                 const isLeft = i % 2 === 0;
 
                 return (
-                  <div key={period.name} className="relative flex items-start gap-0 md:gap-6">
+                  <div
+                    key={period.name}
+                    id={`period-row-${i}`}
+                    className="relative flex items-start gap-0 md:gap-6 scroll-mt-24"
+                  >
                     {/* Left side */}
                     <div className={`hidden md:flex flex-1 ${isLeft ? "justify-end pr-8" : "justify-end pr-8 invisible"}`}>
                       {isLeft && (
@@ -715,7 +766,11 @@ export function HistoricalPeriods() {
           periods={filtered}
           startIndex={storyStartIndex}
           colorFor={(i) => COLOR_PALETTE[i % COLOR_PALETTE.length]}
-          onClose={() => setStoryOpen(false)}
+          onClose={(closedAtIndex) => {
+            setStoryOpen(false);
+            const row = document.getElementById(`period-row-${closedAtIndex}`);
+            row?.scrollIntoView({ behavior: "smooth", block: "center" });
+          }}
         />
       )}
     </div>

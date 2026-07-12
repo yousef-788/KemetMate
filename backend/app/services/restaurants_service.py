@@ -1,10 +1,11 @@
 """
 Restaurants Service
 --------------------
-بيقرأ kemet_restaurants_data.csv من silver/_csv_exports/ على Azure Blob Storage.
+بيقرأ kemet_restaurants_data.csv من الريبو على GitHub مباشرة (Data/silver/)
+بدل Azure Blob Storage — مفيش أي Azure credentials مطلوبة للملف ده خالص دلوقتي.
 
-تحديث: الملف الجديد بقى بأعمدة مختلفة عن اللي كانت قبل كده:
-id, name, category, cuisine, rating, phone_number, government, photo_url, maps, is_non_egypt_address
+الأعمدة زي ما هي: id, name, category, cuisine, rating, phone_number,
+government, photo_url, maps, is_non_egypt_address
 
 القواعد المتبعة (زي ما اتفقنا):
 - عمود Description متسحبش خالص، مش موجود في الرد النهائي أصلاً (والداتا الجديدة مفيهاش العمود ده أصلاً).
@@ -15,16 +16,13 @@ id, name, category, cuisine, rating, phone_number, government, photo_url, maps, 
 - الصفوف اللي عنوانها برّه مصر (is_non_egypt_address = True) بتتشال، لأن الموقع مخصص لمصر.
 - "الأعلى تقييماً" (featured) بيتحسب ديناميكياً من الداتا نفسها، مش قيمة ثابتة مكتوبة في الكود.
 """
-import io
 from functools import lru_cache
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
 
-from app.utils import get_secret
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/kemet_restaurants_data.csv"
+GITHUB_PATH = "Data/silver/kemet_restaurants_data.csv"
 
 FALLBACK_IMAGE = "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=600"
 
@@ -60,23 +58,15 @@ def _clean_phone(value):
 
 @lru_cache(maxsize=1)
 def _load_raw_dataframe() -> pd.DataFrame:
-    connection_string = get_secret("AZURE_DATALAKE_CONNECTION_STRING")
-    if not connection_string:
-        raise RestaurantsDataError(
-            "AZURE_DATALAKE_CONNECTION_STRING غير موجود في الـ environment variables."
-        )
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-        df.columns = df.columns.str.strip()
-        # نشيل أي مطعم عنوانه خارج مصر خالص - الموقع مخصص لمصر بس
-        if "is_non_egypt_address" in df.columns:
-            df = df[df["is_non_egypt_address"] != True]  # noqa: E712
-        return df
-    except Exception as e:
-        raise RestaurantsDataError(f"Error loading restaurants data from Azure: {e}")
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as e:
+        raise RestaurantsDataError(str(e))
+    df.columns = df.columns.str.strip()
+    # نشيل أي مطعم عنوانه خارج مصر خالص - الموقع مخصص لمصر بس
+    if "is_non_egypt_address" in df.columns:
+        df = df[df["is_non_egypt_address"] != True]  # noqa: E712
+    return df
 
 
 def _row_to_record(row) -> dict:

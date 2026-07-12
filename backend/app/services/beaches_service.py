@@ -1,22 +1,20 @@
 """
 Beaches Service
 ----------------
-نفس منطق hotels_service.py بالظبط (نفس طريقة الاتصال بـ Azure Blob،
-نفس أسلوب الـ cache والـ HotelsDataError) لكن للداتا بتاعة الشواطئ
-(kemet_beaches_data.csv) بدل الفنادق.
+نفس منطق hotels_service.py بالظبط (نفس أسلوب الـ cache والـ BeachesDataError)
+لكن للداتا بتاعة الشواطئ (kemet_beaches_data.csv) بدل الفنادق.
+
+تحديث: الداتا بقت بتتقرأ من ملف الريبو على GitHub مباشرة (Data/silver/) بدل
+Azure Blob Storage — مفيش أي Azure credentials مطلوبة للملف ده خالص دلوقتي.
 """
-import io
 import re
 from functools import lru_cache
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
 
-from app.utils import get_secret
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-# لو الكونتينر/الاسم مختلف عندك، غيّرهم هنا بس - الباقي كله شغال زي ما هو.
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/kemet_beaches_data.csv"
+GITHUB_PATH = "Data/silver/kemet_beaches_data.csv"
 
 
 def upscale_photo_url(url: str) -> str:
@@ -32,31 +30,22 @@ def upscale_photo_url(url: str) -> str:
 
 
 class BeachesDataError(Exception):
-    """بترفع لما الاتصال بـ Azure يفشل أو الداتا متبقاش موجودة."""
+    """بترفع لما تحميل الداتا من GitHub يفشل أو الداتا متبقاش موجودة."""
     pass
 
 
 @lru_cache(maxsize=1)
 def _load_raw_dataframe() -> pd.DataFrame:
     """
-    تحميل الـ CSV من Azure Blob Storage مرة واحدة وتخزينه في الذاكرة.
+    تحميل الـ CSV من GitHub مرة واحدة وتخزينه في الذاكرة.
     لإعادة التحميل يدوياً استخدم _load_raw_dataframe.cache_clear()
     """
-    connection_string = get_secret("AZURE_DATALAKE_CONNECTION_STRING")
-    if not connection_string:
-        raise BeachesDataError(
-            "AZURE_DATALAKE_CONNECTION_STRING غير موجود في الـ environment variables."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        raise BeachesDataError(f"Error loading beaches data from Azure: {e}")
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as e:
+        raise BeachesDataError(str(e))
+    df.columns = df.columns.str.strip()
+    return df
 
 
 def _dataframe_to_records(df: pd.DataFrame) -> list[dict]:

@@ -1,6 +1,5 @@
 import datetime
 import difflib
-import io
 import json
 import re
 import threading
@@ -9,33 +8,29 @@ from urllib.parse import quote_plus
 
 import pandas as pd
 from azure.cosmos import CosmosClient, PartitionKey, exceptions
-from azure.storage.blob import BlobServiceClient
 
-from app.config import Config
 from app.utils import get_secret
 from app.services import chatbot_service
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
 MODEL_ID = chatbot_service.MODELS["Flash"]
 
 DATABASE_NAME = "kemetcosmos"
 TRIP_PLANS_CONTAINER_NAME = "TripPlans"
 
-# All data now lives in the "silver" container's "_csv_exports/" folder
-# (confirmed in the Azure portal — the old "sourcedatalake" container is no
-# longer where this data lives). chatbot_service.py's RAG index reads the
-# exact same container/folder, so the trip planner and the chat assistant
-# are guaranteed to be looking at the same data.
-CONTAINER_NAME = "silver"
-CSV_EXPORTS_PREFIX = "_csv_exports/"
+# Data now loads straight from the public GitHub repo's Data/silver/ folder
+# instead of Azure Blob Storage — no Azure credentials needed for any of
+# this. Every other service (beaches_service.py, hotels_service.py, etc.)
+# reads from the same folder, so the trip planner stays in sync with them.
+GITHUB_DATA_DIR = "Data/silver"
 
-# Internal key (used throughout this file) -> actual blob filename under
-# _csv_exports/. A couple of these were renamed during the migration
+# Internal key (used throughout this file) -> actual filename under
+# Data/silver/. A couple of these were renamed at some point
 # (restaurants_gmaps.csv -> kemet_restaurants_data.csv), so if a category
-# comes back oddly empty after this change, it likely means that file's
-# *columns* changed too, not just its name/location — see the row-extraction
-# functions below (_retrieve_dataset_content), which assume the old column
-# names for anything other than Ancient Sites.
-_BLOB_FILENAMES = {
+# comes back oddly empty, it likely means that file's *columns* changed
+# too, not just its name — see the row-extraction functions below
+# (_retrieve_dataset_content), which assume specific column names.
+_CSV_FILENAMES = {
     "Egypt_All_Governorates_Hotels.csv": "egypt_all_governorates_hotels.csv",
     "restaurants_gmaps.csv": "kemet_restaurants_data.csv",
     "Ancient_Sites_En.csv": "ancient_sites_en.csv",
@@ -147,18 +142,12 @@ _csv_lock = threading.Lock()
 CSV_TTL_SECONDS = 1800
 
 
-def _fetch_csv_from_blob(container, blob_name):
-    connection_string = getattr(Config, "AZURE_DATALAKE_CONNECTION_STRING", None)
-    if not connection_string:
-        return pd.DataFrame()
+def _fetch_csv_from_github_path(relative_path):
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=container, blob=blob_name)
-        stream = blob_client.download_blob()
-        return pd.read_csv(io.BytesIO(stream.readall()))
-    except Exception:
+        return fetch_csv_from_github(relative_path)
+    except GithubDataError:
         # Same graceful-degradation approach as the rest of the file: a
-        # missing/renamed blob shouldn't crash the whole itinerary, it just
+        # missing/renamed file shouldn't crash the whole itinerary, it just
         # means that category comes back empty and the planner falls back
         # to generic placeholders for it.
         return pd.DataFrame()
@@ -171,8 +160,8 @@ def _load_csv(name):
         if cached and (now - cached["at"] < CSV_TTL_SECONDS):
             return cached["df"]
 
-    blob_name = CSV_EXPORTS_PREFIX + _BLOB_FILENAMES.get(name, name)
-    df = _fetch_csv_from_blob(CONTAINER_NAME, blob_name)
+    relative_path = f"{GITHUB_DATA_DIR}/{_CSV_FILENAMES.get(name, name)}"
+    df = _fetch_csv_from_github_path(relative_path)
 
     with _csv_lock:
         _csv_cache[name] = {"df": df, "at": now}
@@ -537,7 +526,7 @@ def _retrieve_dataset_content(data, usd_rate=None):
     # NOTE: candidate columns widened below; still worth confirming the real
     # header names via _colmap(raw_restaurants_df) against the actual
     # kemet_restaurants_data.csv (post-migration filename) — see the
-    # module-level comment on _BLOB_FILENAMES.
+    # module-level comment on _CSV_FILENAMES.
     restaurants_df, restaurants_matched = _filter_city(
         raw_restaurants_df,
         ["governorate", "original_name", "address", "city", "name", "location", "government"],

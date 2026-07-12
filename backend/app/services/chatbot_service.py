@@ -5,13 +5,10 @@ Chatbot Service - KEMET AI Assistant
 بنستخدم كاش بسيط في الذاكرة بـ TTL + threading.Lock، بنفس نمط الـ *_service.py الباقية
 في المشروع (museums_service.py, monuments_service.py...).
 """
-import io
 import re
 import time
 import threading
 
-import pandas as pd
-from azure.storage.blob import BlobServiceClient
 from google import genai
 from google.genai import types
 from ddgs import DDGS
@@ -19,6 +16,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from app.config import Config
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
 # ⚠️ اتشالت sentence-transformers/torch خالص من هنا. كانت بتسبب مشاكل تثبيت/DLL
 # على ويندوز (WinError 1114) عند بعض المستخدمين، وأصلاً تقيلة زيادة عن اللزوم هنا
@@ -29,14 +27,15 @@ from app.config import Config
 
 # ── إعدادات ومفاتيح ──
 GEMINI_API_KEY = getattr(Config, "GEMINI_API_KEY", None)
-AZURE_CONNECTION_STRING = getattr(Config, "AZURE_DATALAKE_CONNECTION_STRING", None)
-# الداتا كلها اتنقلت لـ container اسمه "silver"، وجوه الـ container ده بس
-# الفولدر "_csv_exports/" فيه النسخ النضيفة (flat CSV) بتاعة كل داتاسيت -
-# باقي الفولدرات في نفس الـ container (زي الفولدرات الخام بتاعة كل داتاسيت،
-# أو "_dq_report_silver") مش داتا نصيّة نقدر نعمل عليها RAG، فبنقصر البحث
-# على "_csv_exports/" بس (شوف _build_azure_chunks تحت).
-CONTAINER_NAME = "silver"
-CSV_EXPORTS_PREFIX = "_csv_exports/"
+# الداتا كلها بقت بتتقرأ من الريبو على GitHub مباشرة (Data/silver/) بدل Azure
+# Blob Storage - مفيش أي Azure credentials مطلوبة للـ RAG index خالص دلوقتي.
+# GITHUB_DATA_DIR ده هو نفسه اللي بتستخدمه باقي الـ *_service.py (وtrip_planner_service.py).
+GITHUB_DATA_DIR = "Data/silver"
+# Azure كان بيدّينا list_blobs() نلف عليها ديناميكيًا؛ GitHub's raw file host
+# مش عنده حاجة زيها من غير GitHub API (اللي عليه rate limit صارم من غير توكن)،
+# فبدل كده الملفات مكتوبة هنا صراحة - نفس القايمة اللي كانت متوقعة أصلاً في
+# _csv_exports/ قبل كده. لو ضفت داتاسيت جديد لـ Data/silver/، ضيفه هنا كمان.
+DATA_SOURCE_READY = True  # الاسم القديم كان AZURE_CONNECTION_STRING (لسه بيستخدمه trip_planner_service.py)
 
 # ── إعدادات RAG ──
 ROWS_PER_CHUNK = 12
@@ -52,35 +51,35 @@ MODELS = {
 MODES = ["Chat", "Web Search", "Data"]
 
 FILE_KEYWORDS = {
-    f"{CSV_EXPORTS_PREFIX}egypt_all_governorates_hotels.csv": [
+    "egypt_all_governorates_hotels.csv": [
         "فندق", "فنادق", "إقامة", "منتجع", "hotel", "hotels", "resort", "stay"
     ],
-    f"{CSV_EXPORTS_PREFIX}kemet_restaurants_data.csv": [
+    "kemet_restaurants_data.csv": [
         "مطعم", "مطاعم", "أكل", "طعام", "كافيه", "كافيهات",
         "restaurant", "restaurants", "food", "cafe", "eat"
     ],
-    f"{CSV_EXPORTS_PREFIX}museums_en.csv": [
+    "museums_en.csv": [
         "متحف", "متاحف", "museum", "museums"
     ],
-    f"{CSV_EXPORTS_PREFIX}monuments_en.csv": [
+    "monuments_en.csv": [
         "أثر", "آثار", "معبد", "معابد", "monument", "monuments", "temple"
     ],
-    f"{CSV_EXPORTS_PREFIX}ancient_sites_en.csv": [
+    "ancient_sites_en.csv": [
         "موقع أثري", "مواقع أثرية", "site", "sites", "ancient site"
     ],
-    f"{CSV_EXPORTS_PREFIX}collections_en.csv": [
+    "collections_en.csv": [
         "مجموعة", "مجموعات", "قطعة أثرية", "collection", "collections", "artifact"
     ],
-    f"{CSV_EXPORTS_PREFIX}periods_en.csv": [
+    "periods_en.csv": [
         "عصر", "عصور", "فترة تاريخية", "period", "periods", "dynasty", "dynasties"
     ],
-    f"{CSV_EXPORTS_PREFIX}mota_tourism_statistics.csv": [
+    "mota_tourism_statistics.csv": [
         "احصائيات", "احصائية", "سياحة", "statistics", "tourism data", "visitor numbers"
     ],
-    f"{CSV_EXPORTS_PREFIX}kemet_beaches_data.csv": [
+    "kemet_beaches_data.csv": [
         "شاطئ", "شواطئ", "بحر", "beach", "beaches", "coast", "shore"
     ],
-    f"{CSV_EXPORTS_PREFIX}egymonuments_tickets.csv": [
+    "egymonuments_tickets.csv": [
         "تذكرة", "تذاكر", "سعر الدخول", "ticket", "tickets", "entry fee", "admission"
     ],
 }

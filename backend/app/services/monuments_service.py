@@ -1,8 +1,9 @@
 """
 Monuments data service.
 
-Update: the source blob is back to the plain export at
-silver/_csv_exports/monuments_en.csv, with columns:
+Update: the data now loads straight from the GitHub repo (Data/silver/
+monuments_en.csv) instead of Azure Blob Storage — no Azure credentials
+needed for this file anymore. Columns unchanged:
     id, place_name, government, description, open, close, image_url, map
 
 Notes on the mapping:
@@ -28,13 +29,10 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
-import io
 
-from app.config import Config
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/monuments_en.csv"
+GITHUB_PATH = "Data/silver/monuments_en.csv"
 CACHE_TTL_SECONDS = 15 * 60  # matches the effective lifetime st.cache_data had per session
 
 FALLBACK_IMAGE = "https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600"
@@ -75,20 +73,10 @@ _cache = _TTLCache(ttl_seconds=CACHE_TTL_SECONDS)
 
 
 def _fetch_dataframe() -> pd.DataFrame:
-    connection_string = Config.AZURE_DATALAKE_CONNECTION_STRING
-    if not connection_string:
-        raise MonumentsDataError(
-            "Connection details not found. Set AZURE_DATALAKE_CONNECTION_STRING "
-            "as an environment variable (.env locally, or your host's secret/variable settings)."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-    except Exception as exc:  # noqa: BLE001 - surfaced to the API caller as a 502
-        raise MonumentsDataError(f"Error loading data: {exc}") from exc
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as exc:
+        raise MonumentsDataError(str(exc)) from exc
 
     df.columns = df.columns.str.strip()
     for col in ["place_name", "government", "description"]:

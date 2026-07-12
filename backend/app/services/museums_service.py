@@ -1,37 +1,27 @@
 """
 Museums data service.
 
-This is a straight port of the data-loading / cleaning logic that used
-to live inside `museums.py` (the Streamlit page). The differences:
-
-  * st.cache_data  -> a tiny manual TTL cache (see `_TTLCache`), since
-                       there's no Streamlit runtime to cache against.
-  * st.error/st.stop -> raises `MuseumsDataError`, which the Flask route
-                       turns into a proper JSON error response.
-
-Update: the source file changed location/schema. It now lives at
-silver/_csv_exports/museums_en.csv with columns:
+Update: the data now loads straight from the GitHub repo (Data/silver/
+museums_en.csv) instead of Azure Blob Storage — no Azure credentials
+needed for this file anymore. Columns unchanged:
     id, place_name, government, description, open, close, image_url, map
 
-Notably there's no ticket-price column anymore, so museum records no
-longer include a `price` field at all (the featured GEM block below is
-a separate, hand-curated static entry and is unaffected by this).
+Notably there's no ticket-price column, so museum records don't include a
+`price` field at all (the featured GEM block below is a separate,
+hand-curated static entry and is unaffected by this).
 """
 from __future__ import annotations
 
-import io
 import re
 import time
 from dataclasses import dataclass, field
 from threading import Lock
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
 
-from app.config import Config
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/museums_en.csv"
+GITHUB_PATH = "Data/silver/museums_en.csv"
 CACHE_TTL_SECONDS = 15 * 60  # matches the effective lifetime st.cache_data had per session
 
 FALLBACK_IMG = "https://images.unsplash.com/photo-1600577916048-804c9191e36c?w=600"
@@ -72,20 +62,10 @@ _cache = _TTLCache(ttl_seconds=CACHE_TTL_SECONDS)
 
 
 def _fetch_dataframe() -> pd.DataFrame:
-    connection_string = Config.AZURE_DATALAKE_CONNECTION_STRING
-    if not connection_string:
-        raise MuseumsDataError(
-            "Connection details not found. Set AZURE_DATALAKE_CONNECTION_STRING "
-            "as an environment variable (.env locally, or your host's secret/variable settings)."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-    except Exception as exc:  # noqa: BLE001 - surfaced to the API caller as a 502
-        raise MuseumsDataError(f"Error loading data: {exc}") from exc
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as exc:
+        raise MuseumsDataError(str(exc)) from exc
 
     df.columns = df.columns.str.strip()
     for col in ["description", "place_name", "government"]:

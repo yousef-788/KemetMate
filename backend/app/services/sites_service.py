@@ -1,39 +1,27 @@
 """
-Ancient Sites data service — same pattern as `museums_service.py`:
+Ancient Sites data service — same pattern as `museums_service.py`.
 
-  * st.cache_data  -> a tiny manual TTL cache (see `_TTLCache`)
-  * st.error/st.stop -> raises `SitesDataError`, turned into a 502 JSON response
-
-Data source (updated): container `silver`, blob `_csv_exports/ancient_sites_en.csv`
-(confirmed in the Azure portal — the old `sourcedatalake/Ancient_Sites_En.csv`
-blob no longer exists; storage was reorganized into `silver/_csv_exports/`).
-
-Schema also changed with the new file. Old -> new column mapping:
-  place_location  -> government
-  place_description-> description
-  photo_url        -> image_url
-  start_from/end_at-> open/close
-  on_map           -> map
-  (tickets_price column removed entirely — the new source has no pricing
-  data at all, so all price-related parsing/curation from the old service
-  has been dropped. The API no longer returns price/prices/price_note.)
+Update: the data now loads straight from the GitHub repo (Data/silver/
+ancient_sites_en.csv) instead of Azure Blob Storage — no Azure credentials
+needed for this file anymore. Columns unchanged:
+    id, place_name, government, description, open, close, image_url, map
+(no tickets_price column in this export — see tickets_service.py for
+pricing, which comes from a separate dataset.)
 """
 from __future__ import annotations
 
-import io
 import re
 import time
 from dataclasses import dataclass, field
 from threading import Lock
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
 
-from app.config import Config
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/ancient_sites_en.csv"
+GITHUB_PATH = "Data/silver/ancient_sites_en.csv"
 CACHE_TTL_SECONDS = 15 * 60
+
 
 class SitesDataError(Exception):
     """Raised when the ancient-sites dataset can't be loaded."""
@@ -70,20 +58,10 @@ _cache = _TTLCache(ttl_seconds=CACHE_TTL_SECONDS)
 
 
 def _fetch_dataframe() -> pd.DataFrame:
-    connection_string = Config.AZURE_DATALAKE_CONNECTION_STRING
-    if not connection_string:
-        raise SitesDataError(
-            "Connection details not found. Set AZURE_DATALAKE_CONNECTION_STRING "
-            "as an environment variable (.env locally, or your host's secret/variable settings)."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-    except Exception as exc:  # noqa: BLE001 - surfaced to the API caller as a 502
-        raise SitesDataError(f"Error loading data: {exc}") from exc
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as exc:
+        raise SitesDataError(str(exc)) from exc
 
     df.columns = df.columns.str.strip()
     for col in ["description", "place_name", "government"]:

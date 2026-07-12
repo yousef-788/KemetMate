@@ -1,8 +1,10 @@
 """
 Tickets data service (Egypt heritage-site ticket prices).
 
-Mirrors monuments_service.py / periods_service.py, pointed at the
-egymonuments_tickets export in the "silver" blob container.
+Update: the data now loads straight from the GitHub repo (Data/silver/
+egymonuments_tickets.csv) instead of Azure Blob Storage — no Azure
+credentials needed for this file anymore. The live exchange-rate lookup
+below is unrelated to Azure and is unchanged.
 
 IMPORTANT DATA QUIRK: the raw export has two sets of foreigner-price
 columns and they are NOT in the same currency —
@@ -21,7 +23,6 @@ columns directly since those are already confirmed-good EGP.
 """
 from __future__ import annotations
 
-import io
 import re
 import time
 from dataclasses import dataclass, field
@@ -29,12 +30,10 @@ from threading import Lock
 
 import pandas as pd
 import requests
-from azure.storage.blob import BlobServiceClient
 
-from app.config import Config
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/egymonuments_tickets.csv"
+GITHUB_PATH = "Data/silver/egymonuments_tickets.csv"
 CACHE_TTL_SECONDS = 15 * 60
 
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/EGP"
@@ -88,20 +87,10 @@ _rates_cache = _TTLCache(ttl_seconds=EXCHANGE_RATE_CACHE_TTL_SECONDS)
 
 
 def _fetch_dataframe() -> pd.DataFrame:
-    connection_string = Config.AZURE_DATALAKE_CONNECTION_STRING
-    if not connection_string:
-        raise TicketsDataError(
-            "Connection details not found. Set AZURE_DATALAKE_CONNECTION_STRING "
-            "as an environment variable (.env locally, or your host's secret/variable settings)."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-    except Exception as exc:  # noqa: BLE001 - surfaced to the API caller as a 502
-        raise TicketsDataError(f"Error loading data: {exc}") from exc
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as exc:
+        raise TicketsDataError(str(exc)) from exc
 
     df.columns = df.columns.str.strip()
     for col in ["place_name", "location_display", "government", "free_entry_policy"]:

@@ -5,20 +5,19 @@ Hotels Service
 (strip_html, load_data, بناء الـ records) لكن من غير أي استدعاء لـ st.*
 عشان يبقى قابل للاستخدام من أي مكان (Flask routes، سكريبت، تيست...).
 
-تحديث: الداتا بقت جاية من ملف تاني (silver/_csv_exports/egypt_all_governorates_hotels.csv)
-وبأعمدة مختلفة عن اللي كانت قبل كده (id, name, rating_score, city, reviews, price, usd, link, image).
+تحديث: الداتا بقت جاية من ملف الريبو على GitHub مباشرة (Data/silver/
+egypt_all_governorates_hotels.csv) بدل Azure Blob Storage — مفيش أي Azure
+credentials مطلوبة للملف ده خالص دلوقتي. الأعمدة زي ما هي (id, name,
+rating_score, city, reviews, price, usd, link, image).
 """
-import io
 import re
 from functools import lru_cache
 
 import pandas as pd
-from azure.storage.blob import BlobServiceClient
 
-from app.utils import get_secret
+from app.services.data_source import fetch_csv_from_github, GithubDataError
 
-CONTAINER_NAME = "silver"
-BLOB_NAME = "_csv_exports/egypt_all_governorates_hotels.csv"
+GITHUB_PATH = "Data/silver/egypt_all_governorates_hotels.csv"
 
 
 def upscale_image(url: str) -> str:
@@ -46,36 +45,27 @@ def strip_html(text):
 
 
 class HotelsDataError(Exception):
-    """بترفع لما الاتصال بـ Azure يفشل أو الداتا متبقاش موجودة."""
+    """بترفع لما تحميل الداتا من GitHub يفشل أو الداتا متبقاش موجودة."""
     pass
 
 
 @lru_cache(maxsize=1)
 def _load_raw_dataframe() -> pd.DataFrame:
     """
-    تحميل الـ CSV من Azure Blob Storage مرة واحدة وتخزينه في الذاكرة
+    تحميل الـ CSV من GitHub مرة واحدة وتخزينه في الذاكرة
     (نفس فكرة @st.cache_data في الكود الأصلي).
     لإعادة التحميل يدوياً استخدم _load_raw_dataframe.cache_clear()
     """
-    connection_string = get_secret("AZURE_DATALAKE_CONNECTION_STRING")
-    if not connection_string:
-        raise HotelsDataError(
-            "AZURE_DATALAKE_CONNECTION_STRING غير موجود في الـ environment variables."
-        )
-
     try:
-        client = BlobServiceClient.from_connection_string(connection_string)
-        blob_client = client.get_blob_client(container=CONTAINER_NAME, blob=BLOB_NAME)
-        stream = blob_client.download_blob()
-        df = pd.read_csv(io.BytesIO(stream.readall()))
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        raise HotelsDataError(f"Error loading data from Azure: {e}")
+        df = fetch_csv_from_github(GITHUB_PATH)
+    except GithubDataError as e:
+        raise HotelsDataError(str(e))
+    df.columns = df.columns.str.strip()
+    return df
 
 
 def _dataframe_to_records(df: pd.DataFrame) -> list[dict]:
-    # الأعمدة الجديدة: id, name, rating_score, city, reviews, price, usd, link, image
+    # الأعمدة: id, name, rating_score, city, reviews, price, usd, link, image
     df = df[df["image"].notna() & (df["image"].astype(str).str.strip() != "No Image")]
 
     records = []

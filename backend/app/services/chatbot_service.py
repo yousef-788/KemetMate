@@ -35,7 +35,7 @@ GITHUB_DATA_DIR = "Data/silver"
 # مش عنده حاجة زيها من غير GitHub API (اللي عليه rate limit صارم من غير توكن)،
 # فبدل كده الملفات مكتوبة هنا صراحة - نفس القايمة اللي كانت متوقعة أصلاً في
 # _csv_exports/ قبل كده. لو ضفت داتاسيت جديد لـ Data/silver/، ضيفه هنا كمان.
-DATA_SOURCE_READY = True  # الاسم القديم كان AZURE_CONNECTION_STRING (لسه بيستخدمه trip_planner_service.py)
+DATA_SOURCE_READY = True
 
 # ── إعدادات RAG ──
 ROWS_PER_CHUNK = 12
@@ -117,30 +117,30 @@ def _chunk_text(text, source_name):
     return chunks
 
 
-def _build_azure_chunks():
-    try:
-        blob_service = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
-        container = blob_service.get_container_client(CONTAINER_NAME)
-        all_chunks = []
-        # name_starts_with restricts this to the clean, flat CSV exports —
-        # the "silver" container also holds raw per-dataset folders and a
-        # "_dq_report_silver" data-quality report folder that aren't useful
-        # (or even readable as tabular data) for the RAG index.
-        for blob in container.list_blobs(name_starts_with=CSV_EXPORTS_PREFIX):
-            if not blob.name.endswith(('.csv', '.xlsx', '.xls', '.txt', '.md')):
-                continue
-            data = container.get_blob_client(blob).download_blob().readall()
-            if blob.name.endswith('.csv'):
-                df = pd.read_csv(io.BytesIO(data))
-                all_chunks.extend(_chunk_dataframe(df, blob.name))
-            elif blob.name.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(io.BytesIO(data))
-                all_chunks.extend(_chunk_dataframe(df, blob.name))
-            elif blob.name.endswith(('.txt', '.md')):
-                all_chunks.extend(_chunk_text(data.decode('utf-8'), blob.name))
-        return all_chunks
-    except Exception as e:
-        return [{"source": "__error__", "text": f"Error: {e}"}]
+def _build_github_chunks():
+    """بتبني الـ chunks من ملفات CSV اللي بتتقرا من GitHub (Data/silver/) بدل
+    Azure Blob Storage. مفيش list_blobs() ديناميكي هنا (GitHub raw host مش
+    عنده حاجة زيها من غير GitHub API اللي عليه rate limit صارم من غير توكن)،
+    فبدل كده بنلف على نفس قايمة ملفات FILE_KEYWORDS اللي فوق - لو ضفت
+    داتاسيت جديد لـ Data/silver/، ضيفه هناك وهيتلقط هنا تلقائي."""
+    all_chunks = []
+    any_success = False
+    last_error = None
+    for filename in FILE_KEYWORDS:
+        try:
+            df = fetch_csv_from_github(f"{GITHUB_DATA_DIR}/{filename}")
+        except GithubDataError as e:
+            # ملف واحد ناقص/اتغير اسمه ميوقفش باقي الـ index - بس بنكمل للي بعده.
+            last_error = e
+            continue
+        if df is None or df.empty:
+            continue
+        any_success = True
+        all_chunks.extend(_chunk_dataframe(df, filename))
+
+    if not any_success:
+        return [{"source": "__error__", "text": f"Error: could not load any dataset from GitHub ({last_error})"}]
+    return all_chunks
 
 
 # ── كاش الـ chunks + TF-IDF matrix في الذاكرة (بديل st.cache_data + st.cache_resource) ──
@@ -159,7 +159,7 @@ def _build_chunk_index(force=False):
         if fresh:
             return _chunks_cache["chunks"], _chunks_cache["matrix"], _chunks_cache["vectorizer"]
 
-        chunks = _build_azure_chunks()
+        chunks = _build_github_chunks()
         if not chunks or chunks[0]["source"] == "__error__":
             _chunks_cache.update(chunks=chunks, matrix=None, vectorizer=None, built_at=now)
             return chunks, None, None
@@ -290,9 +290,9 @@ def get_reply(user_input, mode="Chat", model_choice="Flash", rate_limit_key="glo
     نقطة الدخول الوحيدة اللي الـ route بينادي عليها.
     بترجع (reply_text, direction, error_code_or_None)
     """
-    if not GEMINI_API_KEY or not AZURE_CONNECTION_STRING:
+    if not GEMINI_API_KEY or not DATA_SOURCE_READY:
         return (
-            "⚠️ الإعدادات ناقصة على السيرفر (GEMINI_API_KEY / AZURE_DATALAKE_CONNECTION_STRING).",
+            "⚠️ الإعدادات ناقصة على السيرفر (GEMINI_API_KEY).",
             "rtl",
             "config_error",
         )

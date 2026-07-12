@@ -858,7 +858,7 @@ def _generate_ai_narrative(data, retrieved):
     اخترناها فعلاً في الخطة، مش نص عام من الموديل لوحده.
     Returns dict: {"summary": str, "day_notes": {"1": str, ...}} - ("" لو فشل).
     """
-    if not chatbot_service.GEMINI_API_KEY or not chatbot_service.AZURE_CONNECTION_STRING:
+    if not chatbot_service.GEMINI_API_KEY or not chatbot_service.DATA_SOURCE_READY:
         return {"summary": "", "day_notes": {}}
 
     query = _rag_query_for_trip(data)
@@ -1039,6 +1039,18 @@ def _get_plans_container():
     return database.create_container_if_not_exists(
         id=TRIP_PLANS_CONTAINER_NAME, partition_key=PartitionKey(path="/Username")
     )
+
+
+def get_total_trip_count() -> int:
+    """Total saved itineraries across every traveler — used only by the
+    dashboard's community-stats cards. TripPlans is partitioned by
+    /Username, so read_all_items() is a cross-partition scan (same
+    pattern as accounts_service.get_community_account_stats)."""
+    container = _get_plans_container()
+    try:
+        return sum(1 for _ in container.read_all_items())
+    except Exception:
+        return 0
 
 
 def save_plan(username, preferences, plan):

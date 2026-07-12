@@ -1,7 +1,8 @@
 import {
   Sun, Sparkles, Search, Phone, CreditCard, Loader2, AlertCircle, RefreshCw,
   Landmark, Hotel, UtensilsCrossed, Waves, MapPin, Car, HeartPulse, MapPinned,
-  Building2, ShoppingBag, Anchor, Briefcase,
+  Building2, ShoppingBag, Anchor, Briefcase, Users, Heart, MessageCircle, Crown,
+  Compass, Globe,
 } from "lucide-react";
 import {
   BarChart, Bar, PieChart, Pie, Cell, LabelList,
@@ -83,6 +84,76 @@ async function fetchSummary(forceRefresh = false): Promise<DashboardSummary> {
   if (!res.ok) throw new Error("Failed to load dashboard data.");
   return res.json();
 }
+
+// -- بيرجع من GET /api/dashboard/community-stats -- كله أرقام حقيقية من Cosmos DB
+// (Users + Posts containers)، مفيش رقم مخترع هنا.
+interface CommunityStats {
+  total_users: number;
+  total_posts: number;
+  total_likes: number;
+  total_comments: number;
+  total_saves: number;
+  most_active_author: string | null;
+  most_active_author_posts: number;
+  total_trips: number;
+  top_country: string | null;
+  top_country_count: number;
+}
+
+async function fetchCommunityStats(): Promise<CommunityStats> {
+  const res = await fetch(`${API_BASE}/api/dashboard/community-stats`);
+  if (!res.ok) throw new Error("Failed to load community stats.");
+  return res.json();
+}
+
+// عداد بيتحرك من 0 للرقم الحقيقي بسلاسة (ease-out) — بيتشغل مرة واحدة لما
+// "start" تبقى true (يعني لما الداتا توصل فعلاً)، مش على كل render.
+function useCountUp(target: number, start: boolean, durationMs = 1400): number {
+  const [value, setValue] = useState(0);
+  useEffect(() => {
+    if (!start) return;
+    let raf: number;
+    const startTime = performance.now();
+    const tick = (now: number) => {
+      const progress = Math.min((now - startTime) / durationMs, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setValue(Math.round(target * eased));
+      if (progress < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, start]);
+  return value;
+}
+
+// كارت رقم واحد في سكشن "KEMET Community" — عداد متحرك + fade-in متدرّج حسب delayMs
+// (كل كارت بيتأخر شوية عن اللي قبله) عشان تبقى الحركة كلها متناسقة مش كل الأرقام
+// بتقفز مرة واحدة سوا.
+function CommunityStatCard({
+  icon: Icon, label, value, start, delayMs = 0,
+}: {
+  icon: typeof Users; label: string; value: number; start: boolean; delayMs?: number;
+}) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setMounted(true), delayMs);
+    return () => clearTimeout(t);
+  }, [delayMs]);
+  const count = useCountUp(value, start && mounted);
+  return (
+    <div
+      className={`bg-white/5 backdrop-blur-sm rounded-2xl p-5 border border-white/10 hover:border-[#D4AF37]/30 hover:-translate-y-1 transition-all duration-500 text-center ${
+        mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-3"
+      }`}
+    >
+      <Icon className="mx-auto mb-2 text-[#D4AF37]" size={22} />
+      <p className="text-2xl font-bold text-white tabular-nums">{count.toLocaleString()}</p>
+      <p className="text-xs text-gray-400 mt-1">{label}</p>
+    </div>
+  );
+}
+
 
 const TYPE_COLORS = ["#dfb257", "#4fc3f7", "#4caf50"];
 
@@ -180,6 +251,18 @@ export function Dashboard() {
 
   useEffect(() => {
     load();
+  }, []);
+
+  // منفصلة تماماً عن fetchSummary — لو Cosmos بطيء أو فيه مشكلة فيه، الشارتات
+  // اللي جايه من Gold مش هتتأثر ولا هتستنى عليه.
+  const [community, setCommunity] = useState<CommunityStats | null>(null);
+  const [communityLoading, setCommunityLoading] = useState(true);
+
+  useEffect(() => {
+    fetchCommunityStats()
+      .then(setCommunity)
+      .catch(() => setCommunity(null))
+      .finally(() => setCommunityLoading(false));
   }, []);
 
   // بيفتح الـ chat bubble العائم ويبعت السؤال المكتوب في الخانة (لو فيه)،
@@ -393,6 +476,58 @@ export function Dashboard() {
               </div>
             </div>
           </div>
+
+          {/* KEMET COMMUNITY — أرقام حقيقية من Cosmos DB (Users/Posts/TripPlans)، مش من الـ Gold layer */}
+          {!communityLoading && community && (
+            <div>
+              <h3 className="text-2xl font-semibold text-gray-100 mb-1">KEMET Community</h3>
+              <p className="text-xs text-gray-500 mb-4">Real numbers from our own travelers, not Egypt-wide statistics</p>
+
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                <CommunityStatCard icon={Users} label="Members" value={community.total_users} start delayMs={0} />
+                <CommunityStatCard icon={MessageCircle} label="Posts Shared" value={community.total_posts} start delayMs={120} />
+                <CommunityStatCard icon={Heart} label="Likes Given" value={community.total_likes} start delayMs={240} />
+                <CommunityStatCard icon={Sparkles} label="Comments" value={community.total_comments} start delayMs={360} />
+                <CommunityStatCard icon={Compass} label="Trips Planned" value={community.total_trips} start delayMs={480} />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {community.most_active_author && (
+                  <div className="bg-gradient-to-r from-[#D4AF37]/10 to-transparent rounded-2xl p-5 border border-[#D4AF37]/20 flex items-center gap-4 hover:border-[#D4AF37]/40 transition-all">
+                    <div className="w-11 h-11 rounded-full bg-[#D4AF37]/15 flex items-center justify-center flex-shrink-0">
+                      <Crown className="text-[#D4AF37]" size={20} />
+                    </div>
+                    <div>
+                      <p className="text-sm text-gray-400">Most Active Member</p>
+                      <p className="text-white font-semibold">
+                        {community.most_active_author}
+                        <span className="text-[#D4AF37] font-normal ml-2 text-sm">
+                          · {community.most_active_author_posts} posts
+                        </span>
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {community.top_country && (
+                  <div className="bg-gradient-to-r from-[#D4AF37]/10 to-transparent rounded-2xl p-5 border border-[#D4AF37]/20 flex items-center gap-4 hover:border-[#D4AF37]/40 transition-all">
+                    <div className="w-11 h-11 rounded-full bg-[#D4AF37]/15 flex items-center justify-center flex-shrink-0">
+                      <Globe className="text-[#D4AF37]" size={20} />
+                    </div>
+                    <div>
+                      <p className="text-sm text-gray-400">Top Country</p>
+                      <p className="text-white font-semibold">
+                        {community.top_country}
+                        <span className="text-[#D4AF37] font-normal ml-2 text-sm">
+                          · {community.top_country_count} members
+                        </span>
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* LIVE WEATHER — بيانات حية */}
           <div>

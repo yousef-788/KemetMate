@@ -404,6 +404,37 @@ def set_password(username: str, new_password: str):
         return False, f"Error updating password: {e}"
 
 
+def get_community_account_stats() -> dict:
+    """Total registered users + the most common Country value among them —
+    used only by the dashboard's community-stats cards. A single full scan
+    of the Users container covers both numbers instead of two separate passes.
+    Users who never set a Country (every account created before this field
+    existed, or who just skipped it) are excluded from the country count,
+    not counted as an empty-string 'country'."""
+    from collections import Counter
+
+    container_users, _ = _get_containers()
+    total = 0
+    country_counter: Counter = Counter()
+    try:
+        for doc in container_users.read_all_items():
+            total += 1
+            country = (doc.get("Country") or "").strip()
+            if country:
+                country_counter[country] += 1
+    except Exception:
+        pass
+
+    top_country, top_country_count = (
+        country_counter.most_common(1)[0] if country_counter else (None, 0)
+    )
+    return {
+        "total_users": total,
+        "top_country": top_country,
+        "top_country_count": top_country_count,
+    }
+
+
 def send_password_reset_email(to_email: str, reset_link: str):
     """Sends a real email with the reset link over SMTP. Configure these as
     secrets (same pattern as COSMOS_ENDPOINT etc.):

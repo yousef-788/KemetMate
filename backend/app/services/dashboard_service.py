@@ -5,10 +5,13 @@ Weather (open-meteo) and currency (open-er-api) stay exactly as before: live dat
 cached in memory for REFRESH_INTERVAL seconds.
 
 Everything tourism-related below is real KEMET Gold-layer data — the Galaxy Schema
-built on Azure Databricks (Bronze -> Silver -> Gold). It's read live from Azure Data
-Lake (the `kemetstorage` account, `gold` container, `_csv_exports` folder — same place
-the weekly Databricks export writes to) using AZURE_DATALAKE_CONNECTION_STRING, and
-kept in memory per process so we don't re-download on every request.
+built on Azure Databricks (Bronze -> Silver -> Gold). The `kemetstorage` Azure
+Storage account that used to serve these CSVs was permanently disabled, so the
+Gold/Silver/Bronze exports now live directly in the GitHub repo instead
+(elsayedashraf05/kemet-assistant, under Data/gold, Data/silver, Data/bronze) and are
+fetched over plain HTTPS from raw.githubusercontent.com — no credentials needed since
+it's a public repo. Kept in memory per process either way, so we don't re-download on
+every request.
 
 Two things are intentionally kept as constants because they were never tourism-catalog
 data to begin with and have no Gold-layer equivalent: emergency phone numbers and the
@@ -118,21 +121,27 @@ def get_live_currency(force_refresh: bool = False):
 
 
 # =========================================================================================
-# GOLD-LAYER DATA — read live from Azure Data Lake (the `kemetstorage` account, `gold`
-# container, `_csv_exports` folder — same place the weekly Databricks export writes to),
-# cached in memory per process so we don't re-download on every request.
+# GOLD-LAYER DATA — read live over HTTPS from the GitHub repo's Data/gold folder
+# (elsayedashraf05/kemet-assistant), which is where the weekly Databricks export now gets
+# committed since the `kemetstorage` Azure Storage account was permanently disabled.
+# raw.githubusercontent.com serves public-repo files with no auth needed, so no
+# connection string / secret is required for this path at all.
 #
-# Uses AZURE_DATALAKE_CONNECTION_STRING specifically — NOT AZURE_STORAGE_CONNECTION_STRING,
-# which is a different storage account used elsewhere (accounts_service.py / posts_service.py
-# for post & profile images). Mixing these up silently returns empty data with no error,
-# which is exactly what happened before this fix.
+# AZURE_DATALAKE_CONNECTION_STRING is kept as an optional path for the future (e.g. if a
+# new storage account ever replaces this one) — set it and it takes priority over GitHub
+# automatically. Leave it unset (the normal case now) and GitHub is used directly.
 #
-# Local-folder fallback (GOLD_DATA_DIR) only kicks in if AZURE_DATALAKE_CONNECTION_STRING
-# isn't set at all — handy for local dev without Azure creds, not used in production.
+# Local-folder fallback (GOLD_DATA_DIR) only kicks in if neither GitHub nor Azure is
+# reachable — handy for local dev with a local copy of Data/gold, not used in production.
 # =========================================================================================
 AZURE_DATALAKE_CONNECTION_STRING = os.environ.get("AZURE_DATALAKE_CONNECTION_STRING")
 GOLD_CONTAINER = os.environ.get("GOLD_CONTAINER", "gold")
 GOLD_BLOB_PREFIX = os.environ.get("GOLD_BLOB_PREFIX", "_csv_exports")
+
+GITHUB_DATA_REPO = os.environ.get("GITHUB_DATA_REPO", "elsayedashraf05/kemet-assistant")
+GITHUB_DATA_BRANCH = os.environ.get("GITHUB_DATA_BRANCH", "main")
+GITHUB_GOLD_PATH = os.environ.get("GITHUB_GOLD_PATH", "Data/gold")
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_DATA_REPO}/{GITHUB_DATA_BRANCH}/{GITHUB_GOLD_PATH}"
 
 GOLD_DATA_DIR = os.environ.get(
     "GOLD_DATA_DIR",
@@ -143,7 +152,7 @@ GOLD_DATA_DIR = os.environ.get(
 )
 
 _gold_cache: dict[str, pd.DataFrame] = {}
-_blob_service_client = None  # lazily created, reused across requests/tables
+_blob_service_client = None  # lazily created, reused across requests/tables — only used if AZURE_DATALAKE_CONNECTION_STRING is set
 
 
 def _get_blob_service_client():
@@ -161,31 +170,45 @@ def _read_gold_csv_from_azure(table: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(raw))
 
 
+def _read_gold_csv_from_github(table: str) -> pd.DataFrame:
+    url = f"{GITHUB_RAW_BASE}/{table}.csv"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    return pd.read_csv(io.BytesIO(r.content))
+
+
+def _gold_source_for(table: str) -> str:
+    """Human-readable source string, only used for logging/the debug endpoint."""
+    if AZURE_DATALAKE_CONNECTION_STRING:
+        return f"azure://{GOLD_CONTAINER}/{GOLD_BLOB_PREFIX}/{table}.csv"
+    return f"{GITHUB_RAW_BASE}/{table}.csv"
+
+
 def _load_gold(table: str) -> pd.DataFrame:
     """Loads a Gold CSV once per process and keeps it in memory. Never raises: a
     missing/unreadable table just logs a warning and serves empty, so it degrades
     that one chart instead of crashing /summary. Call POST /reload after a fresh
-    weekly export lands in Azure to pick it up without a redeploy."""
+    weekly export lands (in the GitHub repo, or Azure if that's configured) to pick
+    it up without a redeploy."""
     if table not in _gold_cache:
         try:
             if AZURE_DATALAKE_CONNECTION_STRING:
                 _gold_cache[table] = _read_gold_csv_from_azure(table)
+            elif GITHUB_DATA_REPO:
+                _gold_cache[table] = _read_gold_csv_from_github(table)
             else:
                 _gold_cache[table] = pd.read_csv(os.path.join(GOLD_DATA_DIR, f"{table}.csv"))
         except Exception as exc:
-            source = (
-                f"azure://{GOLD_CONTAINER}/{GOLD_BLOB_PREFIX}/{table}.csv"
-                if AZURE_DATALAKE_CONNECTION_STRING
-                else os.path.join(GOLD_DATA_DIR, f"{table}.csv")
-            )
+            source = _gold_source_for(table) if (AZURE_DATALAKE_CONNECTION_STRING or GITHUB_DATA_REPO) else os.path.join(GOLD_DATA_DIR, f"{table}.csv")
             logger.warning("Gold table '%s' unavailable at %s (%s) — serving empty.", table, source, exc)
             _gold_cache[table] = pd.DataFrame()
     return _gold_cache[table]
 
 
 def _reload_gold_cache():
-    """Call this after a fresh weekly export lands in Azure, instead of restarting the
-    process — clears the in-memory cache so the next request re-reads the CSVs."""
+    """Call this after a fresh weekly export lands (GitHub commit, or Azure if that's
+    configured), instead of restarting the process — clears the in-memory cache so
+    the next request re-reads the CSVs."""
     _gold_cache.clear()
 
 
@@ -203,17 +226,14 @@ def get_gold_debug_info() -> dict:
     GET /api/dashboard/debug/gold directly when charts come back empty."""
     results = {}
     for table in GOLD_TABLES:
-        source = (
-            f"azure://{GOLD_CONTAINER}/{GOLD_BLOB_PREFIX}/{table}.csv"
-            if AZURE_DATALAKE_CONNECTION_STRING
-            else os.path.join(GOLD_DATA_DIR, f"{table}.csv")
-        )
+        source = _gold_source_for(table)
         try:
-            df = (
-                _read_gold_csv_from_azure(table)
-                if AZURE_DATALAKE_CONNECTION_STRING
-                else pd.read_csv(os.path.join(GOLD_DATA_DIR, f"{table}.csv"))
-            )
+            if AZURE_DATALAKE_CONNECTION_STRING:
+                df = _read_gold_csv_from_azure(table)
+            elif GITHUB_DATA_REPO:
+                df = _read_gold_csv_from_github(table)
+            else:
+                df = pd.read_csv(os.path.join(GOLD_DATA_DIR, f"{table}.csv"))
             results[table] = {
                 "ok": True, "source": source, "rows": int(len(df)),
                 "columns": list(df.columns), "error": None,
@@ -224,10 +244,11 @@ def get_gold_debug_info() -> dict:
                 "columns": [], "error": f"{type(exc).__name__}: {exc}",
             }
     return {
-        "using_azure_datalake": bool(AZURE_DATALAKE_CONNECTION_STRING),
+        "data_source": "azure" if AZURE_DATALAKE_CONNECTION_STRING else ("github" if GITHUB_DATA_REPO else "local"),
         "container": GOLD_CONTAINER if AZURE_DATALAKE_CONNECTION_STRING else None,
         "prefix": GOLD_BLOB_PREFIX if AZURE_DATALAKE_CONNECTION_STRING else None,
-        "local_fallback_dir": GOLD_DATA_DIR if not AZURE_DATALAKE_CONNECTION_STRING else None,
+        "github_raw_base": GITHUB_RAW_BASE if (GITHUB_DATA_REPO and not AZURE_DATALAKE_CONNECTION_STRING) else None,
+        "local_fallback_dir": GOLD_DATA_DIR if not (AZURE_DATALAKE_CONNECTION_STRING or GITHUB_DATA_REPO) else None,
         "tables": results,
     }
 

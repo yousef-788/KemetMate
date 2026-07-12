@@ -2,7 +2,7 @@ import os
 
 from flask import Blueprint, jsonify, request
 
-from app.services import dashboard_service
+from app.services import community_stats_service, dashboard_service
 
 dashboard_bp = Blueprint("dashboard", __name__)
 
@@ -49,6 +49,22 @@ def kemet_data():
     """Gold-derived data on its own — useful if the frontend ever wants to refresh the
     charts without re-hitting the live weather/currency APIs too."""
     return jsonify(dashboard_service.get_kemet_data_bundle())
+
+
+@dashboard_bp.route("/community-stats", methods=["GET"])
+def community_stats():
+    """Real KEMET usage numbers — total members, posts, likes, comments, most active
+    member, trips planned, top country. Powers the 'KEMET Community' cards on the
+    homepage. Kept separate from /summary since this hits Cosmos DB (Users/Posts/
+    TripPlans), not the Gold-layer CSVs — a slow or failing Cosmos call should never
+    block the Gold-driven charts from loading."""
+    try:
+        return jsonify(community_stats_service.get_community_stats())
+    except Exception as e:
+        # Surface the real reason (missing COSMOS_ENDPOINT/KEY, a bad container name,
+        # etc.) instead of a bare 500 with no body — open this URL directly in the
+        # browser while debugging if the cards ever go missing again.
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
 @dashboard_bp.route("/debug/gold", methods=["GET"])

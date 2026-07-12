@@ -2,8 +2,8 @@
 Posts Routes
 ------------
 Community feed endpoints: list/create posts, like, save (bookmark),
-comment, delete, plus the "my posts" / "saved posts" views used on the
-Account page's extra tabs.
+comment (+ like/reply on comments), delete, plus the "my posts" /
+"saved posts" views used on the Account page's extra tabs.
 
 Auth is intentionally OPTIONAL here, same behaviour as the old Streamlit
 pages (home.py / your.py):
@@ -64,12 +64,21 @@ def create_post_route():
         return jsonify({"error": "Please enter your name to post as a guest."}), 400
 
     text = request.form.get("text", "")
-    image_file = request.files.get("file")
-    image_bytes = image_file.read() if image_file else None
-    image_filename = image_file.filename if image_file else None
+    rating = request.form.get("rating") or None
+
+    # Accept either multiple "files" entries, or a single legacy "file"
+    # entry, so older clients still work unmodified.
+    image_files = [
+        (f.read(), f.filename)
+        for f in request.files.getlist("files")
+        if f and f.filename
+    ]
+    legacy_file = request.files.get("file")
+    if legacy_file and legacy_file.filename:
+        image_files.append((legacy_file.read(), legacy_file.filename))
 
     try:
-        post = posts_service.create_post(username, text, image_bytes, image_filename)
+        post = posts_service.create_post(username, text, image_files, rating)
     except PostsError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"post": post})
@@ -131,6 +140,31 @@ def comment_route(owner_username, content_index):
     data = request.get_json(force=True, silent=True) or {}
     try:
         result = posts_service.add_comment(owner_username, content_index, author, data.get("text", ""))
+    except PostsError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@posts_bp.route("/<owner_username>/<int:content_index>/comment/<int:comment_index>/like", methods=["POST"])
+def comment_like_route(owner_username, content_index, comment_index):
+    reactor_id = _resolve_identity()
+    if not reactor_id:
+        return jsonify({"error": "Please enter your name to react."}), 400
+    try:
+        result = posts_service.toggle_comment_like(owner_username, content_index, comment_index, reactor_id)
+    except PostsError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@posts_bp.route("/<owner_username>/<int:content_index>/comment/<int:comment_index>/reply", methods=["POST"])
+def comment_reply_route(owner_username, content_index, comment_index):
+    author = _resolve_identity()
+    if not author:
+        return jsonify({"error": "Please enter your name to reply."}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        result = posts_service.add_reply(owner_username, content_index, comment_index, author, data.get("text", ""))
     except PostsError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(result)

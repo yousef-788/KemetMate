@@ -4,25 +4,40 @@ Posts Service
 Community posts logic, extracted from the old Streamlit pages (home.py +
 your.py) into framework-agnostic functions, same style as accounts_service.py.
 
-Storage layout is unchanged from the Streamlit version, so existing data
-keeps working:
-  Cosmos DB "kemetcosmos" / "Posts" container, partition key /Username:
+Storage layout (Cosmos DB "kemetcosmos" / "Posts" container, partition key
+/Username):
     { id, Username, Content: [ {...post item...}, ... ] }
 
 Each post item now looks like:
   {
     "text": str,
-    "image_url": str | None,
-    "timestamp": iso string,
+    "image_urls": [str, ...],                         # 0-or-more photos
+    "rating": int | None,                              # 1-5 stars, optional
+    "timestamp": iso string (UTC, "...Z"),
     "reactions": { "<emoji>": [reactor_id, ...] },   # "❤️" bucket == Likes
     "saves": [reactor_id, ...],                       # Bookmarks
-    "comments": [ {"author": str, "text": str, "timestamp": iso string}, ... ]
+    "comments": [
+        {
+          "author": str,
+          "text": str,
+          "timestamp": iso string,
+          "likes": [reactor_id, ...],
+          "replies": [ {"author": str, "text": str, "timestamp": iso string}, ... ]
+        }, ...
+    ]
   }
 
 Old documents created by the Streamlit app only had text/image_url/timestamp
-(sometimes reactions). _normalize_item() fills in the missing fields on read
-so nothing breaks. Any older document that still has a leftover "shares"
-key is simply ignored — the Share feature was removed.
+(sometimes reactions). _normalize_item() / _normalize_comment() fill in the
+missing fields on read so nothing breaks. A comment's / reply's position in
+its list is used as its stable id (comment_index / reply_index) — comments
+are only ever appended to or mutated in place, never reordered or removed
+individually, so this stays stable.
+
+Author profile pictures on comments/replies are NOT stored on the comment —
+they're resolved at read time from the Users container (same as the post
+owner's picture), so a user's picture on old comments updates automatically
+whenever they change their avatar, and nothing needs backfilling.
 """
 import datetime
 
@@ -37,10 +52,19 @@ USERS_CONTAINER_NAME = "Users"
 IMAGES_CONTAINER_NAME = "posts"  # Azure Blob container (same one home.py used)
 
 LIKE_EMOJI = "❤️"  # the "Like" button maps onto this reaction bucket
+MAX_IMAGES_PER_POST = 6
 
 
 class PostsError(Exception):
     pass
+
+
+def _now_iso():
+    """UTC, with an explicit 'Z' — the frontend's `new Date(iso)` treats a
+    bare (no-timezone) timestamp as *local* time, so a server running in a
+    different timezone than the viewer used to make every post look posted
+    at the wrong time. Stamping UTC explicitly fixes that everywhere at once."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _get_containers():
@@ -60,16 +84,44 @@ def _get_containers():
     return container_posts, container_users
 
 
+def _normalize_comment(raw_comment):
+    if not isinstance(raw_comment, dict):
+        raw_comment = {"author": "", "text": str(raw_comment)}
+    raw_comment.setdefault("author", "")
+    raw_comment.setdefault("text", "")
+    raw_comment.setdefault("timestamp", "")
+    raw_comment.setdefault("likes", [])
+    raw_comment.setdefault("replies", [])
+    raw_comment["replies"] = [
+        {
+            "author": r.get("author", "") if isinstance(r, dict) else "",
+            "text": r.get("text", "") if isinstance(r, dict) else str(r),
+            "timestamp": r.get("timestamp", "") if isinstance(r, dict) else "",
+        }
+        for r in (raw_comment.get("replies") or [])
+    ]
+    return raw_comment
+
+
 def _normalize_item(raw_item):
-    """Backfills fields on posts that predate reactions/saves/comments."""
+    """Backfills fields on posts that predate reactions/saves/comments/
+    multi-image/rating."""
     if not isinstance(raw_item, dict):
-        raw_item = {"text": str(raw_item), "image_url": None}
+        raw_item = {"text": str(raw_item), "image_urls": []}
     raw_item.setdefault("text", "")
-    raw_item.setdefault("image_url", None)
     raw_item.setdefault("timestamp", "")
     raw_item.setdefault("reactions", {})
     raw_item.setdefault("saves", [])
     raw_item.setdefault("comments", [])
+    raw_item.setdefault("rating", None)
+
+    # Legacy documents stored a single "image_url"; new ones store a list.
+    if "image_urls" not in raw_item:
+        legacy_url = raw_item.get("image_url")
+        raw_item["image_urls"] = [legacy_url] if legacy_url else []
+    raw_item["image_urls"] = [u for u in (raw_item.get("image_urls") or []) if u]
+
+    raw_item["comments"] = [_normalize_comment(c) for c in raw_item.get("comments", [])]
     return raw_item
 
 
@@ -85,22 +137,49 @@ def _profile_pics(container_users):
     return profile_pics
 
 
+def _serialize_comment(comment_index, comment, profile_pics, viewer_id):
+    likes = comment.get("likes", []) or []
+    replies = [
+        {
+            "author": r.get("author", ""),
+            "text": r.get("text", ""),
+            "timestamp": r.get("timestamp", ""),
+            "profile_pic_url": profile_pics.get(r.get("author", ""), ""),
+        }
+        for r in comment.get("replies", [])
+    ]
+    return {
+        "id": comment_index,
+        "author": comment.get("author", ""),
+        "text": comment.get("text", ""),
+        "timestamp": comment.get("timestamp", ""),
+        "profile_pic_url": profile_pics.get(comment.get("author", ""), ""),
+        "likes": len(likes),
+        "liked_by_me": bool(viewer_id) and viewer_id in likes,
+        "replies": replies,
+        "replies_count": len(replies),
+    }
+
+
 def _serialize_item(owner_username, content_index, item, profile_pics, viewer_id):
     likers = (item.get("reactions") or {}).get(LIKE_EMOJI, []) or []
     saves = item.get("saves", []) or []
     comments = item.get("comments", []) or []
+    image_urls = item.get("image_urls", []) or []
     return {
         "owner_username": owner_username,
         "content_index": content_index,
         "text": item.get("text", ""),
-        "image_url": item.get("image_url"),
+        "image_urls": image_urls,
+        "image_url": image_urls[0] if image_urls else None,  # back-compat for older clients
+        "rating": item.get("rating"),
         "timestamp": item.get("timestamp", ""),
         "profile_pic_url": profile_pics.get(owner_username, ""),
         "likes": len(likers),
         "liked_by_me": bool(viewer_id) and viewer_id in likers,
         "saves": len(saves),
         "saved_by_me": bool(viewer_id) and viewer_id in saves,
-        "comments": comments,
+        "comments": [_serialize_comment(idx, c, profile_pics, viewer_id) for idx, c in enumerate(comments)],
         "comments_count": len(comments),
     }
 
@@ -129,34 +208,58 @@ def list_posts(viewer_id=None):
     return all_posts
 
 
-def create_post(username, text, image_bytes=None, image_filename=None):
-    username = (username or "").strip()
-    text = (text or "").strip()
-    if not username:
-        raise PostsError("A name is required to post.")
-    if not text and not image_bytes:
-        raise PostsError("Post cannot be empty.")
+def _upload_images(username, image_files):
+    """image_files: list of (bytes, filename) tuples. Returns list of URLs."""
+    if not image_files:
+        return []
+    storage_conn = get_secret("AZURE_STORAGE_CONNECTION_STRING")
+    if not storage_conn:
+        raise PostsError("Storage connection not configured.")
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(storage_conn)
+    except Exception as e:
+        raise PostsError(f"Error uploading image: {e}")
 
-    container_posts, _ = _get_containers()
-
-    image_url = None
-    if image_bytes:
-        storage_conn = get_secret("AZURE_STORAGE_CONNECTION_STRING")
-        if not storage_conn:
-            raise PostsError("Storage connection not configured.")
+    urls = []
+    for i, (image_bytes, image_filename) in enumerate(image_files):
         try:
-            blob_service_client = BlobServiceClient.from_connection_string(storage_conn)
-            file_name = f"{username}_{datetime.datetime.now().timestamp()}_{image_filename or 'image'}"
+            file_name = f"{username}_{datetime.datetime.now().timestamp()}_{i}_{image_filename or 'image'}"
             blob_client = blob_service_client.get_blob_client(container=IMAGES_CONTAINER_NAME, blob=file_name)
             blob_client.upload_blob(image_bytes, overwrite=True)
-            image_url = blob_client.url
+            urls.append(blob_client.url)
         except Exception as e:
             raise PostsError(f"Error uploading image: {e}")
+    return urls
+
+
+def create_post(username, text, image_files=None, rating=None):
+    """image_files: list of (bytes, filename) tuples (0 or more)."""
+    username = (username or "").strip()
+    text = (text or "").strip()
+    image_files = [f for f in (image_files or []) if f and f[0]][:MAX_IMAGES_PER_POST]
+
+    if not username:
+        raise PostsError("A name is required to post.")
+    if not text and not image_files:
+        raise PostsError("Post cannot be empty.")
+
+    if rating is not None:
+        try:
+            rating = int(rating)
+        except (TypeError, ValueError):
+            rating = None
+        else:
+            if rating < 1 or rating > 5:
+                rating = None
+
+    container_posts, _ = _get_containers()
+    image_urls = _upload_images(username, image_files)
 
     post_item = {
         "text": text,
-        "image_url": image_url,
-        "timestamp": datetime.datetime.now().isoformat(),
+        "image_urls": image_urls,
+        "rating": rating,
+        "timestamp": _now_iso(),
         "reactions": {},
         "saves": [],
         "comments": [],
@@ -253,6 +356,14 @@ def toggle_save(owner_username, content_index, reactor_id):
     return {"saved_by_me": saved, "saves": len(saves)}
 
 
+def _profile_pic_for(container_users, username):
+    try:
+        u = container_users.read_item(item=username, partition_key=username)
+        return u.get("ProfilePicUrl", "") or ""
+    except Exception:
+        return ""
+
+
 def add_comment(owner_username, content_index, author, text):
     author = (author or "").strip()
     text = (text or "").strip()
@@ -261,15 +372,18 @@ def add_comment(owner_username, content_index, author, text):
     if not text:
         raise PostsError("Comment cannot be empty.")
 
-    container_posts, _ = _get_containers()
+    container_posts, container_users = _get_containers()
     doc, content, item = _load_item(container_posts, owner_username, content_index)
 
     comment = {
         "author": author,
         "text": text,
-        "timestamp": datetime.datetime.now().isoformat(),
+        "timestamp": _now_iso(),
+        "likes": [],
+        "replies": [],
     }
     item["comments"].append(comment)
+    comment_index = len(item["comments"]) - 1
     content[content_index] = item
     doc["Content"] = content
     try:
@@ -277,7 +391,75 @@ def add_comment(owner_username, content_index, author, text):
     except Exception as e:
         raise PostsError(f"Error saving comment: {e}")
 
-    return {"comment": comment, "comments_count": len(item["comments"])}
+    profile_pic = _profile_pic_for(container_users, author)
+    return {
+        "comment": _serialize_comment(comment_index, comment, {author: profile_pic}, author),
+        "comments_count": len(item["comments"]),
+    }
+
+
+def toggle_comment_like(owner_username, content_index, comment_index, reactor_id):
+    reactor_id = (reactor_id or "").strip()
+    if not reactor_id:
+        raise PostsError("A name is required to react.")
+
+    container_posts, _ = _get_containers()
+    doc, content, item = _load_item(container_posts, owner_username, content_index)
+
+    comments = item["comments"]
+    if comment_index < 0 or comment_index >= len(comments):
+        raise PostsError("Comment not found.")
+    comment = comments[comment_index]
+
+    likes = comment.setdefault("likes", [])
+    if reactor_id in likes:
+        likes.remove(reactor_id)
+        liked = False
+    else:
+        likes.append(reactor_id)
+        liked = True
+
+    content[content_index] = item
+    doc["Content"] = content
+    try:
+        container_posts.upsert_item(body=doc)
+    except Exception as e:
+        raise PostsError(f"Error saving reaction: {e}")
+
+    return {"liked_by_me": liked, "likes": len(likes)}
+
+
+def add_reply(owner_username, content_index, comment_index, author, text):
+    author = (author or "").strip()
+    text = (text or "").strip()
+    if not author:
+        raise PostsError("A name is required to reply.")
+    if not text:
+        raise PostsError("Reply cannot be empty.")
+
+    container_posts, container_users = _get_containers()
+    doc, content, item = _load_item(container_posts, owner_username, content_index)
+
+    comments = item["comments"]
+    if comment_index < 0 or comment_index >= len(comments):
+        raise PostsError("Comment not found.")
+    comment = comments[comment_index]
+
+    reply = {"author": author, "text": text, "timestamp": _now_iso()}
+    comment.setdefault("replies", []).append(reply)
+
+    content[content_index] = item
+    doc["Content"] = content
+    try:
+        container_posts.upsert_item(body=doc)
+    except Exception as e:
+        raise PostsError(f"Error saving reply: {e}")
+
+    profile_pic = _profile_pic_for(container_users, author)
+    return {
+        "reply": {**reply, "profile_pic_url": profile_pic},
+        "replies_count": len(comment["replies"]),
+    }
 
 
 def delete_post(owner_username, content_index, requester_username):

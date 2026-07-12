@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import {
   Heart, MessageCircle, Bookmark, Camera, MapPin, Send,
   Search, Sparkles, Globe, Filter, Image as ImageIcon, X,
-  Loader2, AlertCircle, Trash2, User as UserIcon, Trophy,
+  Loader2, AlertCircle, Trash2, User as UserIcon, Trophy, Smile,
 } from "lucide-react";
 import { API_BASE_URL } from "../lib/api";
 
@@ -49,6 +49,32 @@ function timeAgo(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+const HASHTAG_RE = /(#[\p{L}\p{N}_]+)/gu;
+
+/** Renders post/comment text with #hashtags as clickable spans. */
+function renderWithHashtags(text: string, onHashtagClick: (tag: string) => void) {
+  const parts = text.split(HASHTAG_RE);
+  return parts.map((part, i) =>
+    part.startsWith("#") ? (
+      <span
+        key={i}
+        onClick={(e) => { e.stopPropagation(); onHashtagClick(part); }}
+        className="text-[#D4AF37] font-medium cursor-pointer hover:underline"
+      >
+        {part}
+      </span>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  );
+}
+
+const EMOJI_PICKS = [
+  "😀", "😂", "😍", "🥰", "😎", "🤩", "😅", "🙌",
+  "👍", "🙏", "❤️", "🔥", "✨", "🎉", "🌍", "🏜️",
+  "🐫", "☀️", "📸", "✈️", "🗺️", "🏛️", "🌅", "😢",
+];
+
 // --- Identity helpers (shared with Account.tsx via localStorage) ---
 
 function getToken(): string | null {
@@ -91,14 +117,57 @@ async function accountApiRequest(path: string, options: RequestInit = {}) {
 // Same endpoint Account.tsx uses to get the real profile_pic_url — this is
 // the authoritative source (set via avatar upload), unlike the JWT payload
 // which only carries the username.
-const apiAccountMe = () => accountApiRequest("/me").then((d) => d.user as { username: string; email: string; profile_pic_url: string });
+const apiAccountMe = () =>
+  accountApiRequest("/me").then(
+    (d) =>
+      d.user as {
+        username: string;
+        email: string;
+        profile_pic_url: string;
+        full_name: string;
+        country: string;
+        language: string;
+        travel_preferences: string[];
+        created_at: string;
+      }
+  );
+
+// Common country names -> 3-letter abbreviation shown next to the poster's
+// name in the composer, e.g. "Egypt" -> "EGY". Falls back to the first 3
+// letters of whatever string the account has, so unlisted countries still
+// show *something* short instead of overflowing the header.
+const COUNTRY_ABBR: Record<string, string> = {
+  Egypt: "EGY", "United States": "USA", "United Kingdom": "UK", Canada: "CAN",
+  Germany: "GER", France: "FRA", Italy: "ITA", Spain: "ESP", Netherlands: "NED",
+  "Saudi Arabia": "KSA", "United Arab Emirates": "UAE", Jordan: "JOR", Morocco: "MAR",
+  Tunisia: "TUN", Algeria: "ALG", Qatar: "QAT", Kuwait: "KUW", Lebanon: "LEB",
+  China: "CHN", Japan: "JPN", India: "IND", Brazil: "BRA", Australia: "AUS",
+  Russia: "RUS", Turkey: "TUR", Greece: "GRE", Portugal: "POR",
+};
+function countryAbbr(country: string): string {
+  if (!country) return "";
+  return COUNTRY_ABBR[country] || country.slice(0, 3).toUpperCase();
+}
 
 // --- API layer ---
 
-interface Comment {
+interface Reply {
   author: string;
   text: string;
   timestamp: string;
+  profile_pic_url: string;
+}
+
+interface Comment {
+  id: number;
+  author: string;
+  text: string;
+  timestamp: string;
+  profile_pic_url: string;
+  likes: number;
+  liked_by_me: boolean;
+  replies: Reply[];
+  replies_count: number;
 }
 
 interface Post {
@@ -106,6 +175,8 @@ interface Post {
   content_index: number;
   text: string;
   image_url: string | null;
+  image_urls: string[];
+  rating: number | null;
   timestamp: string;
   profile_pic_url: string;
   likes: number;
@@ -142,10 +213,11 @@ const apiListPosts = () => postsApiRequest("").then((d) => d.posts as Post[]);
 // browser reload — that's intentional, it's a session cache, not storage.
 let cachedPosts: Post[] | null = null;
 
-const apiCreatePost = (text: string, file: File | null) => {
+const apiCreatePost = (text: string, files: File[], rating: number | null) => {
   const formData = new FormData();
   formData.append("text", text);
-  if (file) formData.append("file", file);
+  for (const f of files) formData.append("files", f);
+  if (rating) formData.append("rating", String(rating));
   return postsApiRequest("", { method: "POST", body: formData }).then((d) => d.post as Post);
 };
 
@@ -161,6 +233,18 @@ const apiComment = (owner: string, idx: number, text: string) =>
     body: JSON.stringify({ text }),
   }) as Promise<{ comment: Comment; comments_count: number }>;
 
+const apiToggleCommentLike = (owner: string, idx: number, commentId: number) =>
+  postsApiRequest(`/${owner}/${idx}/comment/${commentId}/like`, { method: "POST" }) as Promise<{
+    liked_by_me: boolean;
+    likes: number;
+  }>;
+
+const apiReplyToComment = (owner: string, idx: number, commentId: number, text: string) =>
+  postsApiRequest(`/${owner}/${idx}/comment/${commentId}/reply`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  }) as Promise<{ reply: Reply; replies_count: number }>;
+
 const apiDeletePost = (owner: string, idx: number) =>
   postsApiRequest(`/${owner}/${idx}`, { method: "DELETE" });
 
@@ -174,6 +258,76 @@ function Avatar({ name, imageUrl, size = "md" }: { name: string; imageUrl?: stri
   return (
     <div className={`${sizes[size]} rounded-full bg-gradient-to-br ${gradientFor(name)} flex items-center justify-center font-bold text-white flex-shrink-0`}>
       {initialsFor(name)}
+    </div>
+  );
+}
+
+function StarRating({
+  value, onChange, size = 18, readOnly = false,
+}: { value: number; onChange?: (v: number) => void; size?: number; readOnly?: boolean }) {
+  const [hover, setHover] = useState(0);
+  const shown = hover || value;
+  return (
+    <div className="flex items-center gap-0.5">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <button
+          key={n}
+          type="button"
+          disabled={readOnly}
+          onClick={() => onChange?.(n === value ? 0 : n)}
+          onMouseEnter={() => !readOnly && setHover(n)}
+          onMouseLeave={() => !readOnly && setHover(0)}
+          className={`transition-transform ${readOnly ? "cursor-default" : "cursor-pointer hover:scale-110"}`}
+        >
+          <svg
+            width={size} height={size} viewBox="0 0 24 24"
+            fill={n <= shown ? "#D4AF37" : "none"}
+            stroke="#D4AF37" strokeWidth={1.5}
+          >
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+          </svg>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Emoji picker popover. Clicking an emoji inserts it and gives it a quick
+ * pop/bounce animation so the interaction feels alive. */
+function EmojiPicker({ onPick, onClose }: { onPick: (emoji: string) => void; onClose: () => void }) {
+  const [popped, setPopped] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [onClose]);
+
+  return (
+    <div
+      ref={ref}
+      className="absolute z-20 bottom-full mb-2 left-0 bg-[#12152B] border border-white/10 rounded-2xl p-3 shadow-xl grid grid-cols-8 gap-1 w-64"
+    >
+      {EMOJI_PICKS.map((emoji) => (
+        <button
+          key={emoji}
+          type="button"
+          onClick={() => {
+            setPopped(emoji);
+            onPick(emoji);
+            setTimeout(() => setPopped(null), 300);
+          }}
+          className={`text-lg leading-none w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/10 transition-transform ${
+            popped === emoji ? "scale-150" : "scale-100"
+          }`}
+          style={{ transitionDuration: popped === emoji ? "150ms" : "200ms" }}
+        >
+          {emoji}
+        </button>
+      ))}
     </div>
   );
 }
@@ -217,8 +371,125 @@ function GuestNameModal({ onSubmit, onCancel }: { onSubmit: (name: string) => vo
   );
 }
 
+function CommentRow({
+  postOwner, contentIndex, comment, identity, myProfilePicUrl, onCommentChanged, requireIdentity, onHashtagClick,
+}: {
+  postOwner: string;
+  contentIndex: number;
+  comment: Comment;
+  identity: { name: string; loggedIn: boolean };
+  myProfilePicUrl: string | null;
+  onCommentChanged: (updated: Comment) => void;
+  requireIdentity: (action: () => void) => void;
+  onHashtagClick: (tag: string) => void;
+}) {
+  const [replying, setReplying] = useState(false);
+  const [replyText, setReplyText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const likeComment = () =>
+    requireIdentity(() => {
+      const optimisticLiked = !comment.liked_by_me;
+      const optimisticLikes = comment.likes + (optimisticLiked ? 1 : -1);
+      onCommentChanged({ ...comment, liked_by_me: optimisticLiked, likes: optimisticLikes });
+      apiToggleCommentLike(postOwner, contentIndex, comment.id)
+        .then((res) => onCommentChanged({ ...comment, liked_by_me: res.liked_by_me, likes: res.likes }))
+        .catch(() => onCommentChanged({ ...comment, liked_by_me: comment.liked_by_me, likes: comment.likes }));
+    });
+
+  const submitReply = () => {
+    if (!replyText.trim()) return;
+    requireIdentity(async () => {
+      setBusy(true);
+      try {
+        const res = await apiReplyToComment(postOwner, contentIndex, comment.id, replyText.trim());
+        onCommentChanged({ ...comment, replies: [...comment.replies, res.reply], replies_count: res.replies_count });
+        setReplyText("");
+        setReplying(false);
+      } catch {
+        /* ignore */
+      } finally {
+        setBusy(false);
+      }
+    });
+  };
+
+  return (
+    <div className="flex gap-3">
+      <Avatar name={comment.author} imageUrl={comment.profile_pic_url} size="sm" />
+      <div className="flex-1 min-w-0">
+        <div className="bg-white/5 rounded-xl px-3 py-2">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-semibold text-white">{comment.author}</span>
+            <span className="text-xs text-gray-500">{timeAgo(comment.timestamp)}</span>
+          </div>
+          <p className="text-xs text-gray-300 leading-relaxed">{renderWithHashtags(comment.text, onHashtagClick)}</p>
+        </div>
+
+        <div className="flex items-center gap-4 mt-1 pl-1">
+          <button
+            onClick={likeComment}
+            className={`flex items-center gap-1 text-xs font-medium transition-colors ${
+              comment.liked_by_me ? "text-rose-400" : "text-gray-500 hover:text-rose-400"
+            }`}
+          >
+            <Heart size={11} fill={comment.liked_by_me ? "currentColor" : "none"} />
+            {comment.likes > 0 ? comment.likes : "Love"}
+          </button>
+          <button
+            onClick={() => setReplying((r) => !r)}
+            className="text-xs font-medium text-gray-500 hover:text-blue-400 transition-colors"
+          >
+            Reply
+          </button>
+        </div>
+
+        {comment.replies.length > 0 && (
+          <div className="mt-2 space-y-2 pl-4 border-l border-white/10">
+            {comment.replies.map((r, idx) => (
+              <div key={idx} className="flex gap-2">
+                <Avatar name={r.author} imageUrl={r.profile_pic_url} size="sm" />
+                <div className="flex-1 bg-white/5 rounded-xl px-3 py-1.5">
+                  <div className="flex items-center justify-between mb-0.5">
+                    <span className="text-xs font-semibold text-white">{r.author}</span>
+                    <span className="text-xs text-gray-500">{timeAgo(r.timestamp)}</span>
+                  </div>
+                  <p className="text-xs text-gray-300 leading-relaxed">{renderWithHashtags(r.text, onHashtagClick)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {replying && (
+          <div className="flex gap-2 mt-2 pl-4">
+            <Avatar name={identity.name || "?"} imageUrl={myProfilePicUrl} size="sm" />
+            <div className="flex-1 flex gap-2">
+              <input
+                autoFocus
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitReply()}
+                placeholder={`Reply to ${comment.author}...`}
+                className="flex-1 bg-white/10 border border-white/10 rounded-full px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-[#D4AF37]/50 transition-colors"
+              />
+              <button
+                onClick={submitReply}
+                disabled={!replyText.trim() || busy}
+                className="w-7 h-7 rounded-full bg-[#D4AF37] text-black flex items-center justify-center hover:bg-[#C9A84C] transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0 self-center"
+              >
+                {busy ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const PostCard = memo(function PostCard({
-  post, identity, myProfilePicUrl, onChanged, onDeleted, requireIdentity,
+  post, identity, myProfilePicUrl, onChanged, onDeleted, requireIdentity, onHashtagClick,
 }: {
   post: Post;
   identity: { name: string; loggedIn: boolean };
@@ -226,11 +497,14 @@ const PostCard = memo(function PostCard({
   onChanged: (updated: Post) => void;
   onDeleted: (owner: string, idx: number) => void;
   requireIdentity: (action: () => void) => void;
+  onHashtagClick: (tag: string) => void;
 }) {
   const [showComments, setShowComments] = useState(false);
   const [commentText, setCommentText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [imgIndex, setImgIndex] = useState(0);
   const isOwn = identity.name !== "" && identity.name === post.owner_username;
+  const images = post.image_urls?.length ? post.image_urls : post.image_url ? [post.image_url] : [];
 
   const like = () =>
     requireIdentity(() => {
@@ -270,6 +544,9 @@ const PostCard = memo(function PostCard({
     });
   };
 
+  const updateComment = (updated: Comment) =>
+    onChanged({ ...post, comments: post.comments.map((c) => (c.id === updated.id ? updated : c)) });
+
   const remove = async () => {
     if (!window.confirm("Delete this post?")) return;
     try {
@@ -303,34 +580,71 @@ const PostCard = memo(function PostCard({
         )}
       </div>
 
-      {/* Content */}
-      {post.text && (
-        <div className="px-5 pb-3">
-          <p className="text-gray-200 text-sm leading-relaxed whitespace-pre-wrap">{post.text}</p>
+      {/* Rating */}
+      {!!post.rating && (
+        <div className="px-5 pb-2">
+          <StarRating value={post.rating} readOnly size={14} />
         </div>
       )}
 
-      {/* Image */}
-      {post.image_url && (
-        <div className="mx-5 mb-4 rounded-xl overflow-hidden">
+      {/* Content */}
+      {post.text && (
+        <div className="px-5 pb-3">
+          <p className="text-gray-200 text-sm leading-relaxed whitespace-pre-wrap">
+            {renderWithHashtags(post.text, onHashtagClick)}
+          </p>
+        </div>
+      )}
+
+      {/* Image(s) */}
+      {images.length > 0 && (
+        <div className="mx-5 mb-4 rounded-xl overflow-hidden relative">
           <img
-            src={post.image_url}
+            src={images[imgIndex]}
             alt="post"
             loading="lazy"
             decoding="async"
             className="w-full max-h-[420px] object-cover"
           />
+          {images.length > 1 && (
+            <>
+              <div className="absolute top-2 right-2 bg-black/60 text-white text-xs px-2 py-0.5 rounded-full">
+                {imgIndex + 1}/{images.length}
+              </div>
+              {imgIndex > 0 && (
+                <button
+                  onClick={() => setImgIndex((i) => i - 1)}
+                  className="absolute left-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-black/50 text-white flex items-center justify-center hover:bg-black/70"
+                >
+                  ‹
+                </button>
+              )}
+              {imgIndex < images.length - 1 && (
+                <button
+                  onClick={() => setImgIndex((i) => i + 1)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-black/50 text-white flex items-center justify-center hover:bg-black/70"
+                >
+                  ›
+                </button>
+              )}
+              <div className="absolute bottom-2 left-1/2 -translate-x-1/2 flex gap-1">
+                {images.map((_, i) => (
+                  <span key={i} className={`w-1.5 h-1.5 rounded-full ${i === imgIndex ? "bg-[#D4AF37]" : "bg-white/40"}`} />
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
 
-      {/* Stats bar */}
-      <div className="px-5 py-2 border-t border-white/5 flex items-center justify-between text-xs text-gray-500">
+      {/* Stats bar — same text size/weight for all three so they read as one row */}
+      <div className="px-5 py-2 border-t border-white/5 flex items-center justify-between text-xs font-normal text-gray-500">
         <span>{post.likes.toLocaleString()} likes</span>
         <div className="flex gap-3">
-          <button onClick={() => setShowComments(!showComments)} className="hover:text-gray-300 transition-colors">
+          <button onClick={() => setShowComments(!showComments)} className="text-xs font-normal hover:text-gray-300 transition-colors">
             {post.comments_count} comments
           </button>
-          <span>{post.saves} saves</span>
+          <span className="text-xs font-normal">{post.saves} saves</span>
         </div>
       </div>
 
@@ -366,17 +680,18 @@ const PostCard = memo(function PostCard({
       {/* Latest 2 comments — visible without expanding anything */}
       {!showComments && post.comments.length > 0 && (
         <div className="border-t border-white/5 px-5 py-3 space-y-3">
-          {post.comments.slice(-2).map((c, idx) => (
-            <div key={idx} className="flex gap-2">
-              <Avatar name={c.author} size="sm" />
-              <div className="flex-1 bg-white/5 rounded-xl px-3 py-2">
-                <div className="flex items-center justify-between mb-0.5">
-                  <span className="text-xs font-semibold text-white">{c.author}</span>
-                  <span className="text-xs text-gray-500">{timeAgo(c.timestamp)}</span>
-                </div>
-                <p className="text-xs text-gray-300 leading-relaxed">{c.text}</p>
-              </div>
-            </div>
+          {post.comments.slice(-2).map((c) => (
+            <CommentRow
+              key={c.id}
+              postOwner={post.owner_username}
+              contentIndex={post.content_index}
+              comment={c}
+              identity={identity}
+              myProfilePicUrl={myProfilePicUrl}
+              onCommentChanged={updateComment}
+              requireIdentity={requireIdentity}
+              onHashtagClick={onHashtagClick}
+            />
           ))}
           {post.comments_count > 2 && (
             <button
@@ -395,17 +710,18 @@ const PostCard = memo(function PostCard({
           {post.comments.length === 0 && (
             <p className="text-xs text-gray-500">No comments yet — be the first.</p>
           )}
-          {post.comments.map((c, idx) => (
-            <div key={idx} className="flex gap-3">
-              <Avatar name={c.author} size="sm" />
-              <div className="flex-1 bg-white/5 rounded-xl px-3 py-2">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-xs font-semibold text-white">{c.author}</span>
-                  <span className="text-xs text-gray-500">{timeAgo(c.timestamp)}</span>
-                </div>
-                <p className="text-xs text-gray-300 leading-relaxed">{c.text}</p>
-              </div>
-            </div>
+          {post.comments.map((c) => (
+            <CommentRow
+              key={c.id}
+              postOwner={post.owner_username}
+              contentIndex={post.content_index}
+              comment={c}
+              identity={identity}
+              myProfilePicUrl={myProfilePicUrl}
+              onCommentChanged={updateComment}
+              requireIdentity={requireIdentity}
+              onHashtagClick={onHashtagClick}
+            />
           ))}
 
           <div className="flex gap-3 mt-2">
@@ -441,10 +757,15 @@ export function Community() {
 
   const [composerOpen, setComposerOpen] = useState(false);
   const [newPostText, setNewPostText] = useState("");
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [newRating, setNewRating] = useState(0);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [myCountry, setMyCountry] = useState("");
+  const [myFullName, setMyFullName] = useState("");
 
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFilter, setActiveFilter] = useState<"Latest" | "Photos">("Latest");
@@ -523,15 +844,17 @@ export function Community() {
   );
 
   const publishPost = () => {
-    if (!newPostText.trim() && !uploadFile) return;
+    if (!newPostText.trim() && uploadFiles.length === 0) return;
     requireIdentity(async () => {
       setPublishing(true);
       setPublishError("");
       try {
-        const post = await apiCreatePost(newPostText.trim(), uploadFile);
+        const post = await apiCreatePost(newPostText.trim(), uploadFiles, newRating || null);
         applyPosts((prev) => [post, ...prev]);
         setNewPostText("");
-        setUploadFile(null);
+        setUploadFiles([]);
+        setNewRating(0);
+        setShowEmojiPicker(false);
         if (fileInputRef.current) fileInputRef.current.value = "";
         setComposerOpen(false);
       } catch (e) {
@@ -542,10 +865,27 @@ export function Community() {
     });
   };
 
+  const insertEmoji = (emoji: string) => {
+    const el = textareaRef.current;
+    if (!el) {
+      setNewPostText((t) => t + emoji);
+      return;
+    }
+    const start = el.selectionStart ?? newPostText.length;
+    const end = el.selectionEnd ?? newPostText.length;
+    const next = newPostText.slice(0, start) + emoji + newPostText.slice(end);
+    setNewPostText(next);
+    requestAnimationFrame(() => {
+      el.focus();
+      el.selectionStart = el.selectionEnd = start + emoji.length;
+    });
+  };
+
   const filteredPosts = posts.filter((p) => {
-    if (activeFilter === "Photos" && !p.image_url) return false;
+    if (activeFilter === "Photos" && !(p.image_urls?.length || p.image_url)) return false;
     if (!searchQuery) return true;
-    return p.owner_username.toLowerCase().includes(searchQuery.toLowerCase());
+    const q = searchQuery.toLowerCase();
+    return p.owner_username.toLowerCase().includes(q) || p.text.toLowerCase().includes(q);
   });
 
   // `identity` only carries {name, loggedIn} straight from the JWT — it never
@@ -560,12 +900,19 @@ export function Community() {
   useEffect(() => {
     if (!identity.loggedIn) {
       setMyProfilePicUrl(null);
+      setMyCountry("");
+      setMyFullName("");
       return;
     }
     let cancelled = false;
     apiAccountMe()
-      .then((u) => { if (!cancelled) setMyProfilePicUrl(u.profile_pic_url || null); })
-      .catch(() => { if (!cancelled) setMyProfilePicUrl(null); });
+      .then((u) => {
+        if (cancelled) return;
+        setMyProfilePicUrl(u.profile_pic_url || null);
+        setMyCountry(u.country || "");
+        setMyFullName(u.full_name || "");
+      })
+      .catch(() => { if (!cancelled) { setMyProfilePicUrl(null); setMyCountry(""); setMyFullName(""); } });
     return () => { cancelled = true; };
   }, [identity.loggedIn, identity.name]);
 
@@ -671,14 +1018,21 @@ export function Community() {
                 <div className="flex items-center gap-3">
                   <Avatar name={identity.name || "?"} imageUrl={myProfilePicUrl} size="md" />
                   <div>
-                    <p className="text-sm font-semibold text-white">Share Your Experience</p>
-                    <p className="text-xs text-gray-400">
-                      {identity.loggedIn
-                        ? `Posting as @${identity.name}`
-                        : identity.name
-                        ? `Posting as @${identity.name} (guest)`
-                        : "Visible to all KEMET travelers"}
-                    </p>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <p className="text-sm font-semibold text-white">
+                        {identity.name ? myFullName || identity.name : "Share Your Experience"}
+                      </p>
+                      {identity.name && <span className="text-xs text-gray-400">@{identity.name}</span>}
+                      {myCountry && (
+                        <span className="text-[10px] font-semibold text-[#D4AF37] bg-[#D4AF37]/10 border border-[#D4AF37]/30 rounded-full px-1.5 py-0.5">
+                          {countryAbbr(myCountry)}
+                        </span>
+                      )}
+                      {!identity.loggedIn && identity.name && (
+                        <span className="text-[10px] text-gray-500">(guest)</span>
+                      )}
+                    </div>
+                    <p className="text-xs text-gray-400">Visible to all KEMET travelers</p>
                   </div>
                 </div>
                 <button onClick={() => setComposerOpen(false)} className="text-gray-500 hover:text-white transition-colors">
@@ -687,31 +1041,63 @@ export function Community() {
               </div>
 
               <textarea
+                ref={textareaRef}
                 value={newPostText}
                 onChange={(e) => setNewPostText(e.target.value)}
-                placeholder="Describe your experience, tips, hidden gems, honest thoughts..."
+                placeholder="Describe your experience, tips, hidden gems, honest thoughts... #hashtags welcome"
                 rows={4}
                 maxLength={500}
                 className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[#D4AF37]/40 transition-colors resize-none"
               />
 
-              <div className="flex items-center gap-3">
-                <label className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-[#D4AF37] transition-colors cursor-pointer">
-                  <ImageIcon size={16} />
-                  {uploadFile ? uploadFile.name : "Add photo"}
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/jpeg,image/png,image/jpg"
-                    className="hidden"
-                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
-                  />
-                </label>
-                {uploadFile && (
-                  <button onClick={() => { setUploadFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }} className="text-xs text-gray-500 hover:text-red-400">
-                    Remove
+              {uploadFiles.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {uploadFiles.map((f, i) => (
+                    <div key={i} className="relative w-16 h-16 rounded-lg overflow-hidden border border-white/10 group">
+                      <img src={URL.createObjectURL(f)} alt={f.name} className="w-full h-full object-cover" />
+                      <button
+                        onClick={() => setUploadFiles((prev) => prev.filter((_, idx) => idx !== i))}
+                        className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity"
+                      >
+                        <X size={14} className="text-white" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div className="flex items-center gap-4 relative">
+                  <label className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-[#D4AF37] transition-colors cursor-pointer">
+                    <ImageIcon size={16} />
+                    {uploadFiles.length > 0 ? `${uploadFiles.length} photo${uploadFiles.length > 1 ? "s" : ""}` : "Add photos"}
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/jpeg,image/png,image/jpg"
+                      multiple
+                      className="hidden"
+                      onChange={(e) => setUploadFiles((prev) => [...prev, ...Array.from(e.target.files || [])].slice(0, 6))}
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowEmojiPicker((v) => !v)}
+                    className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-[#D4AF37] transition-colors"
+                  >
+                    <Smile size={16} />
+                    Emoji
                   </button>
-                )}
+                  {showEmojiPicker && (
+                    <EmojiPicker onPick={insertEmoji} onClose={() => setShowEmojiPicker(false)} />
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500">Your rating</span>
+                  <StarRating value={newRating} onChange={setNewRating} size={16} />
+                </div>
               </div>
 
               {publishError && (
@@ -727,7 +1113,7 @@ export function Community() {
                 </span>
                 <button
                   onClick={publishPost}
-                  disabled={(!newPostText.trim() && !uploadFile) || publishing}
+                  disabled={(!newPostText.trim() && uploadFiles.length === 0) || publishing}
                   className="px-5 py-2 bg-[#D4AF37] hover:bg-[#C9A84C] text-black text-sm font-semibold rounded-xl transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
                 >
                   {publishing ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
@@ -759,6 +1145,7 @@ export function Community() {
                 onChanged={updatePostInList}
                 onDeleted={removePostFromList}
                 requireIdentity={requireIdentity}
+                onHashtagClick={(tag) => setSearchQuery(tag)}
               />
             ))
           )}

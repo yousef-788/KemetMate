@@ -8,7 +8,7 @@ import {
   User, Heart, Users, PartyPopper,
   Bus, Car, CarFront, Footprints,
   Accessibility, ShieldCheck, Sun, Lightbulb, Wallet, BadgeCheck,
-  MessageCircle, Send,
+  MessageCircle, Send, ExternalLink,
 } from "lucide-react";
 import { API_BASE_URL } from "../lib/api";
 
@@ -68,7 +68,7 @@ interface Preferences {
 interface Item {
   name: string; city: string; desc: string; url: string; price: string;
   price_usd?: number | null;
-  link?: string; hours?: string; rating?: number | null; rating_label?: string; phone?: string; address?: string;
+  link?: string; book_link?: string; hours?: string; rating?: number | null; rating_label?: string; phone?: string; address?: string;
 }
 interface DayPlan {
   day: number; city: string; title: string;
@@ -762,7 +762,7 @@ function TripDetailsForm({ options, prefs, updatePrefs, toggleCity, toggleIntere
   );
 }
 
-// ── Generic card grid, used for sites/monuments/museums/beaches/hotels ──
+// ── Generic card grid, used for sites/monuments/museums/beaches ──
 function ItemGrid({ icon: Icon, title, items, note }: { icon: React.ElementType; title: string; items: Item[]; note?: string }) {
   if (!items.length) return null;
   return (
@@ -790,17 +790,19 @@ function ItemGrid({ icon: Icon, title, items, note }: { icon: React.ElementType;
               {item.hours && item.hours !== "Not Available" && (
                 <div className="text-white/40 text-[11px] mb-2">🕐 {item.hours}</div>
               )}
-              {(formatPrice(item.price, item.price_usd) || item.link) && (
-                <div className="flex items-center justify-between gap-2">
-                  {formatPrice(item.price, item.price_usd) && (
-                    <div className="text-xs font-bold" style={{ color: GOLD }}>{formatPrice(item.price, item.price_usd)}</div>
-                  )}
-                  {item.link && (
-                    <a href={item.link} target="_blank" rel="noreferrer" className="text-[11px] font-semibold underline" style={{ color: GOLD }}>
-                      View on map
-                    </a>
-                  )}
-                </div>
+              {formatPrice(item.price, item.price_usd) && (
+                <div className="text-xs font-bold mb-2" style={{ color: GOLD }}>{formatPrice(item.price, item.price_usd)}</div>
+              )}
+              {item.link && (
+                <a
+                  href={item.link}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center justify-center gap-1.5 text-xs font-semibold py-2 rounded-lg w-full"
+                  style={{ background: `linear-gradient(135deg, ${GOLD}, #C9A84C)`, color: "#0A0B1E" }}
+                >
+                  <MapPinIcon size={13} /> View on map
+                </a>
               )}
             </div>
           </div>
@@ -878,6 +880,67 @@ function RestaurantGrid({ items, note }: { items: Item[]; note?: string }) {
                     className="flex-1 flex items-center justify-center gap-1 text-[11px] font-semibold py-1.5 rounded-lg border border-white/10 text-white/70"
                   >
                     <Phone size={11} /> Call
+                  </a>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Hotel card: distinct from ItemGrid because hotels have two genuinely
+// different links — a Booking.com deal link (book_link) and a map/directions
+// link (link) — where the generic card only ever had room for one. ──
+function HotelGrid({ items, note }: { items: Item[]; note?: string }) {
+  if (!items.length) return null;
+  return (
+    <div className="mb-8">
+      <SectionHeader icon={Hotel} title="Stays" />
+      {note && (
+        <div className="flex items-start gap-2 text-xs text-white/50 mb-3 bg-white/5 border border-white/10 rounded-xl px-3 py-2">
+          <Info size={13} className="mt-0.5 flex-shrink-0" /> {note}
+        </div>
+      )}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 tp-stagger">
+        {items.map((item, idx) => (
+          <div key={idx} className="rounded-2xl overflow-hidden border border-white/10 bg-white/5 hover:border-yellow-500/40 hover:-translate-y-0.5 transition-all duration-200">
+            {item.url ? (
+              <img src={item.url} alt={item.name} className="w-full h-32 object-cover" />
+            ) : (
+              <div className="w-full h-32 flex items-center justify-center bg-white/[0.03]">
+                <Hotel size={22} className="text-white/15" />
+              </div>
+            )}
+            <div className="p-3">
+              <div className="text-white font-semibold text-sm mb-0.5 truncate">{item.name}</div>
+              <div className="text-white/40 text-xs mb-1">{item.city}</div>
+              <div className="text-white/50 text-xs line-clamp-2 mb-2">{item.desc}</div>
+              {formatPrice(item.price, item.price_usd) && (
+                <div className="text-xs font-bold mb-2" style={{ color: GOLD }}>{formatPrice(item.price, item.price_usd)}</div>
+              )}
+              <div className="flex gap-2">
+                {item.book_link && (
+                  <a
+                    href={item.book_link}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex-1 flex items-center justify-center gap-1 text-[11px] font-semibold py-1.5 rounded-lg"
+                    style={{ background: `linear-gradient(135deg, ${GOLD}, #C9A84C)`, color: "#0A0B1E" }}
+                  >
+                    <ExternalLink size={11} /> Book now
+                  </a>
+                )}
+                {item.link && (
+                  <a
+                    href={item.link}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex-1 flex items-center justify-center gap-1 text-[11px] font-semibold py-1.5 rounded-lg border border-white/10 text-white/70"
+                  >
+                    <MapPinIcon size={11} /> View on map
                   </a>
                 )}
               </div>
@@ -1152,7 +1215,7 @@ function ResultView({ plan, onStartOver, onAdjust, savedView }: { plan: Plan; on
       <ItemGrid icon={Library} title="Museums" items={plan.museums} />
       <ItemGrid icon={Waves} title="Beaches" items={plan.beaches} note={plan.beaches_note} />
       <RestaurantGrid items={plan.restaurants} note={plan.restaurants_note} />
-      <ItemGrid icon={Hotel} title="Stays" items={plan.hotels} note={plan.hotels_note} />
+      <HotelGrid items={plan.hotels} note={plan.hotels_note} />
 
       {/* Actions */}
       <div className="flex flex-col md:flex-row gap-3 mt-8 pb-8">

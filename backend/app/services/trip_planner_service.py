@@ -91,22 +91,21 @@ DEFAULT_PREFERENCES = {
 def _egp_per_usd():
     """Live EGP-per-USD rate, reusing dashboard_service.get_live_currency()
     (open.er-api.com, 5-minute cache) instead of a fresh conversion helper.
-    Its exact return shape (bare float? {"EGP": rate}? a tuple?) wasn't
-    visible from this file, so this unwraps a few likely shapes defensively.
-    Returns None on any failure so callers can just omit the *_usd fields."""
+
+    Confirmed shape from dashboard_service.py: get_live_currency() returns
+    either None (API down and nothing cached yet) or a dict of
+    {"USD": <EGP per 1 USD>, "EUR": <EGP per 1 EUR>, "GBP": ..., "SAR": ...,
+    "AED": ...} — i.e. result["USD"] IS the EGP-per-USD rate we need, not a
+    currency code to look up inside it."""
     try:
         from app.services.dashboard_service import get_live_currency
         result = get_live_currency()
     except Exception:
         return None
+    if not isinstance(result, dict):
+        return None
     try:
-        if isinstance(result, dict):
-            rate = result.get("EGP") or result.get("egp") or result.get("rate") or result.get("value")
-        elif isinstance(result, (tuple, list)) and result:
-            rate = result[0]
-        else:
-            rate = result
-        rate = float(rate)
+        rate = float(result.get("USD"))
         return rate if rate > 0 else None
     except (TypeError, ValueError):
         return None
@@ -591,14 +590,26 @@ def _retrieve_dataset_content(data, usd_rate=None):
                     r["price"] = match
         return records
 
-    sites_list = _apply_ticket_price(
+    def _ensure_map_link(records):
+        """Guarantee every card has a usable "View on map" link, even when
+        the dataset's own map/URL column was empty for that particular row,
+        by falling back to a plain Google Maps text search — so the button
+        never silently disappears from a card."""
+        for r in records:
+            if not r.get("link"):
+                r["link"] = _maps_search_link(r.get("name", ""), r.get("city", ""))
+        return records
+
+    sites_list = _ensure_map_link(_apply_ticket_price(
         _records_from_attractions(sites_df, "place_name", "government", "description", "image_url", None, 8, map_col="map", open_col="open", close_col="close")
-    )
-    monuments_list = _apply_ticket_price(
+    ))
+    monuments_list = _ensure_map_link(_apply_ticket_price(
         _records_from_attractions(monuments_df, "monument", "location", "Description", "photo_url", "tickets_price", 8, map_col="on_map", open_col="start_from", close_col="end_at")
+    ))
+    museums_list = _ensure_map_link(
+        _records_from_attractions(museums_df, "museum", "location", "Description", "photo_url", "tickets_price", 8, map_col="on_map", open_col="start_from", close_col="end_at")
     )
-    museums_list = _records_from_attractions(museums_df, "museum", "location", "Description", "photo_url", "tickets_price", 8, map_col="on_map", open_col="start_from", close_col="end_at")
-    beaches_list = _records_from_beaches(beaches_df, num_beaches)
+    beaches_list = _ensure_map_link(_records_from_beaches(beaches_df, num_beaches))
 
     food = []
     if not restaurants_df.empty:
@@ -711,7 +722,15 @@ def _retrieve_dataset_content(data, usd_rate=None):
                 "url": _safe_image(str(raw_img) if raw_img is not None else "", h_name, HOTEL_FALLBACK_IMAGES),
                 "price": price_val,
                 "price_usd": _to_usd(price_egp_num, usd_rate),
-                "link": _clean(_pick(row, hotel_cmap, "link", "url", "booking_url"), 400),
+                # NOTE: this dataset's "link"/"url"/"booking_url" column is a
+                # Booking.com deal link (confirmed against hotels_service.py,
+                # which reads the exact same egypt_all_governorates_hotels.csv
+                # and returns this same column as its "link" field) — it was
+                # previously mislabeled as a map link. "link" below is now a
+                # real, separately-generated map search link, and the
+                # Booking.com link lives in "book_link".
+                "book_link": _clean(_pick(row, hotel_cmap, "link", "url", "booking_url"), 400),
+                "link": _maps_search_link(h_name, city_val),
             })
 
     return {

@@ -143,6 +143,14 @@ function TripPlannerStyles() {
       .tp-stagger > *:nth-child(5) { animation-delay: 0.19s; }
       .tp-stagger > *:nth-child(6) { animation-delay: 0.23s; }
       .tp-stagger > *:nth-child(n+7) { animation-delay: 0.26s; }
+
+      /* Same themed scrollbar as Sidebar.tsx's .kemet-scrollbar, reused here
+         for the "Ask about this trip" panel's message list. */
+      .kemet-scrollbar { scrollbar-width: thin; scrollbar-color: rgba(201, 168, 76, 0.35) transparent; }
+      .kemet-scrollbar::-webkit-scrollbar { width: 5px; }
+      .kemet-scrollbar::-webkit-scrollbar-track { background: transparent; }
+      .kemet-scrollbar::-webkit-scrollbar-thumb { background-color: rgba(201, 168, 76, 0.35); border-radius: 9999px; }
+      .kemet-scrollbar::-webkit-scrollbar-thumb:hover { background-color: rgba(201, 168, 76, 0.6); }
     `}</style>
   );
 }
@@ -1073,7 +1081,7 @@ function AskAboutTrip({ plan }: { plan: Plan }) {
       {!open && (
         <button
           onClick={() => setOpen(true)}
-          className="fixed bottom-6 right-6 z-40 flex items-center gap-2 pl-4 pr-5 py-3.5 rounded-full font-semibold text-sm shadow-2xl tp-pulse tp-pop"
+          className="fixed bottom-24 right-6 z-40 flex items-center gap-2 pl-4 pr-5 py-3.5 rounded-full font-semibold text-sm shadow-2xl tp-pulse tp-pop"
           style={{ background: `linear-gradient(135deg, ${GOLD}, #C9A84C)`, color: "#0A0B1E" }}
         >
           <MessageCircle size={18} /> Ask about this trip
@@ -1082,7 +1090,7 @@ function AskAboutTrip({ plan }: { plan: Plan }) {
 
       {/* Panel */}
       {open && (
-        <div className="fixed bottom-6 right-6 z-40 w-[calc(100vw-3rem)] sm:w-96 h-[28rem] max-h-[70vh] rounded-2xl border border-white/10 shadow-2xl flex flex-col overflow-hidden tp-pop" style={{ background: "#12132a" }}>
+        <div className="fixed bottom-24 right-6 z-40 w-[calc(100vw-3rem)] sm:w-96 h-[28rem] max-h-[calc(70vh-4.5rem)] rounded-2xl border border-white/10 shadow-2xl flex flex-col overflow-hidden tp-pop" style={{ background: "#12132a" }}>
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10" style={{ background: `linear-gradient(135deg, rgba(212,175,55,0.15), transparent)` }}>
             <div className="flex items-center gap-2">
               <Sparkles size={15} style={{ color: GOLD }} />
@@ -1093,7 +1101,7 @@ function AskAboutTrip({ plan }: { plan: Plan }) {
             </button>
           </div>
 
-          <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+          <div ref={scrollRef} className="kemet-scrollbar flex-1 overflow-y-auto px-4 py-3 space-y-3">
             {messages.length === 0 && (
               <p className="text-white/35 text-xs text-center py-8 leading-relaxed">
                 Ask anything about this itinerary — swap a day, ask about a site, check if a restaurant fits your budget.

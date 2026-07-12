@@ -1,4 +1,5 @@
 import datetime
+import difflib
 import io
 import json
 import re
@@ -87,12 +88,53 @@ DEFAULT_PREFERENCES = {
 }
 
 
+def _egp_per_usd():
+    """Live EGP-per-USD rate, reusing dashboard_service.get_live_currency()
+    (open.er-api.com, 5-minute cache) instead of a fresh conversion helper.
+    Its exact return shape (bare float? {"EGP": rate}? a tuple?) wasn't
+    visible from this file, so this unwraps a few likely shapes defensively.
+    Returns None on any failure so callers can just omit the *_usd fields."""
+    try:
+        from app.services.dashboard_service import get_live_currency
+        result = get_live_currency()
+    except Exception:
+        return None
+    try:
+        if isinstance(result, dict):
+            rate = result.get("EGP") or result.get("egp") or result.get("rate") or result.get("value")
+        elif isinstance(result, (tuple, list)) and result:
+            rate = result[0]
+        else:
+            rate = result
+        rate = float(rate)
+        return rate if rate > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_usd(amount_egp, egp_per_usd):
+    if egp_per_usd is None or amount_egp is None:
+        return None
+    try:
+        return round(float(amount_egp) / egp_per_usd, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def get_options():
     """كل الداتا الثابتة اللي الفرونت محتاجها عشان يبني الـ wizard من غير ما يكررها."""
+    usd_rate = _egp_per_usd()
+    budgets = []
+    for name, v in BUDGETS.items():
+        entry = {"name": name, **v}
+        daily_usd = _to_usd(v["daily"], usd_rate)
+        if daily_usd is not None:
+            entry["daily_usd"] = daily_usd
+        budgets.append(entry)
     return {
         "governorates": get_available_governorates(),
         "interests": [{"name": i} for i in INTERESTS.keys()],
-        "budgets": [{"name": b, **v} for b, v in BUDGETS.items()],
+        "budgets": budgets,
         "travel_styles": [{"name": s} for s in ["Solo", "Couple", "Family", "Friends"]],
         "transport_modes": [{"name": t, "note": n} for t, n in TRANSPORT_NOTES.items()],
         "defaults": DEFAULT_PREFERENCES,
@@ -459,7 +501,7 @@ def _records_from_beaches(df, num_beaches):
     return records
 
 
-def _retrieve_dataset_content(data):
+def _retrieve_dataset_content(data, usd_rate=None):
     cities = data.get("cities", [])
     destination = data.get("destination", "")
     budget = data.get("budget", "Comfort")
@@ -470,47 +512,81 @@ def _retrieve_dataset_content(data):
     monuments_df, _ = _filter_city(_load_csv("monuments_en.csv"), ["location", "monument"], cities, destination)
     museums_df, _ = _filter_city(_load_csv("museums_en.csv"), ["location", "museum"], cities, destination)
     raw_beaches_df = _load_csv("kemet_beaches_data.csv")
-    beaches_df, beaches_matched = _filter_city(raw_beaches_df, ["governorate", "city", "name"], cities, destination)
+    # NOTE: verify these are the real column names in kemet_beaches_data.csv
+    # via _colmap(raw_beaches_df) — this couldn't be checked directly in this
+    # environment (no live Blob Storage/network access here), and a silent
+    # governorate-column mismatch was called out as the likely reason
+    # Alexandria beaches were coming back empty even though the city has
+    # real entries in the dataset.
+    beaches_df, beaches_matched = _filter_city(
+        raw_beaches_df, ["governorate", "city", "name", "location", "beach_name", "area", "government"],
+        cities, destination, allow_region_fallback=False,
+    )
     beaches_note = ""
     num_beaches = int(data.get("num_beaches", 4))
     if beaches_df.empty and not raw_beaches_df.empty and num_beaches > 0:
-        beaches_note = "No beaches found for this city in our dataset yet — showing top-rated picks across Egypt instead."
-        beaches_df = raw_beaches_df
+        # Explicit product decision: unlike restaurants/hotels, beaches never
+        # fall back to unrelated governorates — if this city truly has none
+        # in the dataset, say so plainly instead of showing e.g. a Red Sea
+        # beach under an Alexandria itinerary.
+        city_label = (destination or (cities[0] if cities else "")).strip() or "this city"
+        beaches_note = f"No beaches found for {city_label} in our dataset."
     elif not beaches_matched:
-        beaches_note = "Exact-city matches were limited, so this list also includes nearby-region picks."
-    if num_beaches > 0 and len(beaches_df) < num_beaches:
-        beaches_df, topped_beaches = _top_up_rows(beaches_df, [raw_beaches_df], num_beaches)
-        if topped_beaches and not beaches_note:
-            beaches_note = "Your chosen city didn't have enough beaches in our dataset, so this list also includes other highly-rated coastal picks."
+        beaches_note = "Exact-city matches were limited, so this list also includes nearby same-governorate picks."
 
     raw_restaurants_df = _load_csv("restaurants_gmaps.csv")
+    # NOTE: candidate columns widened below; still worth confirming the real
+    # header names via _colmap(raw_restaurants_df) against the actual
+    # kemet_restaurants_data.csv (post-migration filename) — see the
+    # module-level comment on _BLOB_FILENAMES.
     restaurants_df, restaurants_matched = _filter_city(
-        raw_restaurants_df, ["governorate", "original_name", "address", "city", "name"], cities, destination
+        raw_restaurants_df,
+        ["governorate", "original_name", "address", "city", "name", "location", "government"],
+        cities, destination,
     )
     restaurants_note = ""
     if restaurants_df.empty and not raw_restaurants_df.empty:
-        restaurants_note = "No restaurants found for this city in our dataset yet — showing top-rated picks across Egypt instead."
+        restaurants_note = "No restaurants found for this city or nearby in our dataset yet — showing top-rated picks across Egypt instead."
         restaurants_df = raw_restaurants_df
     elif not restaurants_matched:
-        restaurants_note = "Exact-city matches were limited, so this list also includes nearby-region picks."
+        restaurants_note = "Exact-city matches were limited, so this list also includes nearby same-region picks."
 
     raw_hotels_df = _load_csv("Egypt_All_Governorates_Hotels.csv")
     hotels_df, hotels_matched = _filter_city(
-        raw_hotels_df, ["city", "Place_Name", "Address", "governorate", "name"], cities, destination
+        raw_hotels_df,
+        ["city", "Place_Name", "Address", "governorate", "name", "location", "government"],
+        cities, destination,
     )
     hotels_note = ""
     if hotels_df.empty and not raw_hotels_df.empty:
-        hotels_note = "No hotels found for this city in our dataset yet — showing top-rated picks across Egypt instead."
+        hotels_note = "No hotels found for this city or nearby in our dataset yet — showing top-rated picks across Egypt instead."
         hotels_df = raw_hotels_df
     elif not hotels_matched:
-        hotels_note = "Exact-city matches were limited, so this list also includes nearby-region picks."
+        hotels_note = "Exact-city matches were limited, so this list also includes nearby same-region picks."
 
     ticket_prices = _load_ticket_prices()
+    _ticket_price_keys = list(ticket_prices.keys())
+
+    def _fuzzy_ticket_price(name):
+        """Exact match first; if that misses, fall back to closest-name
+        matching (site/monument names in the sites/monuments datasets don't
+        always match egymonuments_tickets.csv verbatim — e.g. slightly
+        different transliteration or an extra "Temple of"/"The" prefix)."""
+        norm_name = _norm(name)
+        exact = ticket_prices.get(norm_name)
+        if exact:
+            return exact
+        if not _ticket_price_keys:
+            return None
+        close = difflib.get_close_matches(norm_name, _ticket_price_keys, n=1, cutoff=0.72)
+        if close:
+            return ticket_prices[close[0]]
+        return None
 
     def _apply_ticket_price(records):
         for r in records:
             if r["price"] in ("N/A", "", "Price details not available."):
-                match = ticket_prices.get(_norm(r["name"]))
+                match = _fuzzy_ticket_price(r["name"])
                 if match:
                     r["price"] = match
         return records
@@ -619,8 +695,13 @@ def _retrieve_dataset_content(data):
             room_val = _pick(row, hotel_cmap, "room_info", "room_type", "amenities")
             raw_img = _pick(row, hotel_cmap, "image", "photo_url", "image_url")
             price_num = _pick(row, hotel_cmap, "price_egp", "price", "price_per_night")
+            price_egp_num = None
             try:
-                price_val = f"EGP {int(float(price_num))} / night" if price_num is not None else "Contact for Rates"
+                if price_num is not None:
+                    price_egp_num = int(float(price_num))
+                    price_val = f"EGP {price_egp_num} / night"
+                else:
+                    price_val = "Contact for Rates"
             except (TypeError, ValueError):
                 price_val = "Contact for Rates"
             stays.append({
@@ -629,6 +710,7 @@ def _retrieve_dataset_content(data):
                 "desc": f"⭐ {rating_val or 'Rated'} · {clean_hours(str(room_val or 'Value Room'))}",
                 "url": _safe_image(str(raw_img) if raw_img is not None else "", h_name, HOTEL_FALLBACK_IMAGES),
                 "price": price_val,
+                "price_usd": _to_usd(price_egp_num, usd_rate),
                 "link": _clean(_pick(row, hotel_cmap, "link", "url", "booking_url"), 400),
             })
 
@@ -681,6 +763,37 @@ def _source_badges(retrieved):
     return badges
 
 
+def _pool_for_city(items, city):
+    """Picks the subset of an already-retrieved list (attractions or
+    restaurants, each a dict with a "city" key) that belongs to `city`,
+    escalating through the same CITY_SYNONYMS/REGION_FALLBACK ladder that
+    _filter_city uses at the dataset level, instead of silently falling
+    back to the full cross-governorate pool the moment a direct match is
+    empty (the bug: an Alexandria day could otherwise surface an Aswan or
+    Cairo attraction/restaurant with no indication it's from elsewhere).
+
+    Returns (pool, same_city: bool). Only returns the entire `items` list
+    as an absolute last resort, with same_city=False so the caller can
+    surface that honestly instead of presenting it as a same-city pick."""
+    city_norm = _norm(city)
+
+    direct = [it for it in items if city_norm in _norm(it.get("city", ""))]
+    if direct:
+        return direct, True
+
+    for term in CITY_SYNONYMS.get(city_norm, []):
+        pool = [it for it in items if _norm(term) in _norm(it.get("city", ""))]
+        if pool:
+            return pool, True
+
+    for term in REGION_FALLBACK.get(city_norm, []):
+        pool = [it for it in items if _norm(term) in _norm(it.get("city", ""))]
+        if pool:
+            return pool, False
+
+    return items, False
+
+
 def _build_days(data, attractions, restaurants, day_notes=None):
     cities = data["cities"] or ["Egypt"]
     days_total = int(data["days"])
@@ -692,12 +805,20 @@ def _build_days(data, attractions, restaurants, day_notes=None):
         city_idx = min((day - 1) * num_cities // days_total, num_cities - 1)
         city = cities[city_idx]
 
-        city_attractions = [a for a in attractions if city.lower() in a["city"].lower()] or attractions
-        city_restaurants = [r for r in restaurants if city.lower() in r["city"].lower()] or restaurants
+        city_attractions, attractions_same_city = _pool_for_city(attractions, city)
+        city_restaurants, restaurants_same_city = _pool_for_city(restaurants, city)
 
         primary = city_attractions[(day - 1) % len(city_attractions)]
         secondary = city_attractions[day % len(city_attractions)]
         food = city_restaurants[(day - 1) % len(city_restaurants)]
+
+        ai_note = day_notes.get(str(day), "")
+        if not attractions_same_city or not restaurants_same_city:
+            mismatch_note = (
+                f"Our dataset didn't have enough picks specifically in {city}, so some "
+                f"suggestions above are from elsewhere in Egypt rather than {city} itself."
+            )
+            ai_note = f"{ai_note} {mismatch_note}".strip() if ai_note else mismatch_note
 
         days.append({
             "day": day,
@@ -706,7 +827,7 @@ def _build_days(data, attractions, restaurants, day_notes=None):
             "morning": f"Start with {primary['name']}. {primary['desc']}",
             "afternoon": f"Continue to {secondary['name']} for a complementary local stop.",
             "evening": f"Dinner near {food['name']} ({food['desc']}), then keep the evening {data['pace'].lower()}.",
-            "ai_note": day_notes.get(str(day), ""),
+            "ai_note": ai_note,
             "food": food,
             "transport": TRANSPORT_NOTES[data["transport"]],
         })
@@ -833,7 +954,8 @@ def build_plan(raw_data):
     except (TypeError, ValueError):
         data["days"] = 5
 
-    retrieved = _retrieve_dataset_content(data)
+    usd_rate = _egp_per_usd()
+    retrieved = _retrieve_dataset_content(data, usd_rate=usd_rate)
     combined_attractions = retrieved["sites"] + retrieved["monuments"] + retrieved["museums"]
     if not combined_attractions:
         combined_attractions = [{
@@ -857,6 +979,17 @@ def build_plan(raw_data):
     low = daily * data["days"]
     high = int(low * (1.35 if data["budget"] != "Luxury" else 1.6))
 
+    budget_block = {
+        "low": low, "high": high, "daily": daily,
+        "note": "Estimate covers entry tickets, local transport buffers, and dining. Stays vary by season.",
+    }
+    low_usd, high_usd, daily_usd = _to_usd(low, usd_rate), _to_usd(high, usd_rate), _to_usd(daily, usd_rate)
+    if usd_rate and low_usd is not None:
+        budget_block["low_usd"] = low_usd
+        budget_block["high_usd"] = high_usd
+        budget_block["daily_usd"] = daily_usd
+        budget_block["fx_rate_egp_usd"] = usd_rate
+
     return {
         "preferences": data,
         "summary": narrative.get("summary") or (
@@ -866,7 +999,7 @@ def build_plan(raw_data):
         "budget_tier": data.get("budget", "Comfort"),
         "cities": data["cities"],
         "days": days,
-        "budget": {"low": low, "high": high, "daily": daily, "note": "Estimate covers entry tickets, local transport buffers, and dining. Stays vary by season."},
+        "budget": budget_block,
         "sites": retrieved["sites"],
         "monuments": retrieved["monuments"],
         "museums": retrieved["museums"],

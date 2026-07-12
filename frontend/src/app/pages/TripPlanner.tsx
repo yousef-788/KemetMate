@@ -36,7 +36,7 @@ async function api(path: string, options: RequestInit = {}) {
 }
 
 // ── Types (mirror trip_planner_service.py) ──
-interface BudgetOption { name: string; daily: number; hotel: string; label: string }
+interface BudgetOption { name: string; daily: number; daily_usd?: number; hotel: string; label: string }
 interface InterestOption { name: string }
 interface TravelStyleOption { name: string }
 interface TransportOption { name: string; note: string }
@@ -67,6 +67,7 @@ interface Preferences {
 
 interface Item {
   name: string; city: string; desc: string; url: string; price: string;
+  price_usd?: number | null;
   link?: string; hours?: string; rating?: number | null; rating_label?: string; phone?: string; address?: string;
 }
 interface DayPlan {
@@ -74,7 +75,10 @@ interface DayPlan {
   morning: string; afternoon: string; evening: string; ai_note: string;
   food: Item; transport: string;
 }
-interface BudgetEstimate { low: number; high: number; daily: number; note: string }
+interface BudgetEstimate {
+  low: number; high: number; daily: number; note: string;
+  low_usd?: number; high_usd?: number; daily_usd?: number; fx_rate_egp_usd?: number;
+}
 interface Plan {
   preferences: Preferences;
   summary: string;
@@ -102,6 +106,16 @@ interface Plan {
 
 const GOLD = "#D4AF37";
 const BG = "#0A0B1E";
+
+// Formats a price string with its USD equivalent when we have one, e.g.
+// "3,200 EGP/day (~$65)". Returns null for unknown prices ("N/A" or empty)
+// so callers can hide the price line entirely instead of ever printing the
+// literal "N/A" next to a "View on map" link.
+function formatPrice(price?: string, priceUsd?: number | null): string | null {
+  if (!price || price === "N/A") return null;
+  if (priceUsd == null) return price;
+  return `${price} (~$${priceUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })})`;
+}
 
 // One-time keyframes for this page's animations — kept local rather than
 // touching the global stylesheet, since `.fade-in` etc. already come from
@@ -606,7 +620,9 @@ function TripDetailsForm({ options, prefs, updatePrefs, toggleCity, toggleIntere
                 </div>
                 <div className="text-white/40 text-xs mb-1">{b.label}</div>
                 <div className="text-white/30 text-[11px]">{b.hotel}</div>
-                <div className="text-xs font-bold mt-2" style={{ color: GOLD }}>~{b.daily.toLocaleString()} EGP/day</div>
+                <div className="text-xs font-bold mt-2" style={{ color: GOLD }}>
+                  ~{b.daily.toLocaleString()} EGP/day{b.daily_usd != null && ` (~$${b.daily_usd.toLocaleString(undefined, { maximumFractionDigits: 0 })})`}
+                </div>
               </button>
             ))}
           </div>
@@ -774,14 +790,18 @@ function ItemGrid({ icon: Icon, title, items, note }: { icon: React.ElementType;
               {item.hours && item.hours !== "Not Available" && (
                 <div className="text-white/40 text-[11px] mb-2">🕐 {item.hours}</div>
               )}
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-xs font-bold" style={{ color: GOLD }}>{item.price}</div>
-                {item.link && (
-                  <a href={item.link} target="_blank" rel="noreferrer" className="text-[11px] font-semibold underline" style={{ color: GOLD }}>
-                    View on map
-                  </a>
-                )}
-              </div>
+              {(formatPrice(item.price, item.price_usd) || item.link) && (
+                <div className="flex items-center justify-between gap-2">
+                  {formatPrice(item.price, item.price_usd) && (
+                    <div className="text-xs font-bold" style={{ color: GOLD }}>{formatPrice(item.price, item.price_usd)}</div>
+                  )}
+                  {item.link && (
+                    <a href={item.link} target="_blank" rel="noreferrer" className="text-[11px] font-semibold underline" style={{ color: GOLD }}>
+                      View on map
+                    </a>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         ))}
@@ -837,7 +857,9 @@ function RestaurantGrid({ items, note }: { items: Item[]; note?: string }) {
                   <Phone size={11} /> {item.phone}
                 </div>
               )}
-              <div className="text-xs font-bold mb-2" style={{ color: GOLD }}>{item.price}</div>
+              {formatPrice(item.price, item.price_usd) && (
+                <div className="text-xs font-bold mb-2" style={{ color: GOLD }}>{formatPrice(item.price, item.price_usd)}</div>
+              )}
               <div className="flex gap-2">
                 {item.link && (
                   <a
@@ -894,7 +916,12 @@ function TripOverviewCard({ plan }: { plan: Plan }) {
             <div className="flex items-center gap-1.5 text-white/40 text-[11px] font-semibold uppercase tracking-wide mb-1.5">
               <Wallet size={12} /> Estimated budget
             </div>
-            <div className="text-white font-bold text-sm">{plan.budget.low.toLocaleString()} – {plan.budget.high.toLocaleString()} EGP</div>
+            <div className="text-white font-bold text-sm">
+              {plan.budget.low.toLocaleString()} – {plan.budget.high.toLocaleString()} EGP
+              {plan.budget.low_usd != null && plan.budget.high_usd != null && (
+                <span className="text-white/50 font-semibold"> (~${plan.budget.low_usd.toLocaleString(undefined, { maximumFractionDigits: 0 })} – ${plan.budget.high_usd.toLocaleString(undefined, { maximumFractionDigits: 0 })})</span>
+              )}
+            </div>
             <div className="text-white/35 text-[11px] mt-1 leading-snug">{plan.budget.note}</div>
           </div>
         )}
